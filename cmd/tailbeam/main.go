@@ -32,8 +32,10 @@ Common flags: --port 8784 --timeout 1h --deadline 0 --socket PATH
               downloading; receive: until an offer is found)
   --deadline  absolute cap on the whole command, including an active transfer
               (default 0 = none)
+Send flags: --v1 (serve protocol v1, without resume, for older receivers)
 Receive flags: --dir . --max-bytes 1073741824 --idle-timeout 5m --yes
-  --idle-timeout  abort a download when no bytes arrive for this long
+  --idle-timeout  abort a download when no bytes arrive for this long; an
+                  interrupted v2 download resumes when receive is rerun
   --yes           accept without the interactive confirmation prompt
 receive asks "Accept? [y/N]" on the terminal; without a terminal it requires --yes.
 `
@@ -65,6 +67,10 @@ func run(ctx context.Context, args []string) error {
 	var max *int64
 	var idle *time.Duration
 	var yes *bool
+	v1 := new(bool)
+	if mode == "send" {
+		v1 = fs.Bool("v1", false, "serve protocol v1 (no resume) for older receivers")
+	}
 	if mode == "receive" {
 		idle = fs.Duration("idle-timeout", 5*time.Minute, "abort a download when no bytes arrive for this long")
 		yes = fs.Bool("yes", false, "skip the confirmation prompt")
@@ -102,12 +108,12 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	if mode == "send" {
-		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout)
+		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout, *v1)
 	}
 	return receive(ctx, b, s, fs.Arg(0), *port, *dir, *max, *timeout, *idle, *yes)
 }
 
-func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration) error {
+func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration, v1 bool) error {
 	peer, err := tailnet.Resolve(status, host)
 	if err != nil {
 		return err
@@ -116,7 +122,11 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 	if err != nil {
 		return err
 	}
-	s, err := transfer.NewSender(ctx, path, func(ctx context.Context, addr string) error { return tailnet.Verify(ctx, b, addr, peer.ID) })
+	authorize := func(ctx context.Context, addr string) error { return tailnet.Verify(ctx, b, addr, peer.ID) }
+	if !v1 {
+		return sendV2(ctx, status, peer, ip, path, port, timeout, authorize)
+	}
+	s, err := transfer.NewSender(ctx, path, authorize)
 	if err != nil {
 		return err
 	}
@@ -128,24 +138,12 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 	defer l.Close()
 	// --timeout bounds only the wait for a receiver; once the first file request
 	// begins, the sender's per-write deadline handles stalls.
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	wait := time.AfterFunc(timeout, func() { cancel(errWaitTimeout) })
-	defer wait.Stop()
-	go func() {
-		select {
-		case <-s.Started():
-			wait.Stop()
-		case <-ctx.Done():
-		}
-	}()
+	ctx, stop := waitForReceiver(ctx, timeout, s.Started())
+	defer stop()
 	fmt.Fprintf(os.Stderr, "Offering %q (%d bytes) to %q [%s] only.\n", s.Offer.Name, s.Offer.Size, peer.DNSName, peer.ID)
 	fmt.Fprintf(os.Stderr, "On that host run: tailbeam receive --port %d %s\n", port, status.Self.ID)
 	if err := transfer.Serve(ctx, l, s); err != nil {
-		if errors.Is(context.Cause(ctx), errWaitTimeout) {
-			return fmt.Errorf("timed out after %s waiting for the receiver", timeout)
-		}
-		return err
+		return serveErr(ctx, err, timeout)
 	}
 	fmt.Fprintln(os.Stderr, "Receiver acknowledged the saved file.")
 	return nil
@@ -153,9 +151,53 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 
 var errWaitTimeout = errors.New("wait timeout")
 
+// waitForReceiver bounds ctx by timeout until started is closed; after that an
+// active transfer is limited only by the sender's per-write deadlines.
+func waitForReceiver(ctx context.Context, timeout time.Duration, started <-chan struct{}) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	wait := time.AfterFunc(timeout, func() { cancel(errWaitTimeout) })
+	go func() {
+		select {
+		case <-started:
+			wait.Stop()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { wait.Stop(); cancel(nil) }
+}
+
+func serveErr(ctx context.Context, err error, timeout time.Duration) error {
+	if errors.Is(context.Cause(ctx), errWaitTimeout) {
+		return fmt.Errorf("timed out after %s waiting for the receiver", timeout)
+	}
+	return err
+}
+
+func sendV2(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip, path string, port int, timeout time.Duration, authorize transfer.Authorize) error {
+	s, err := transfer.NewSenderV2(ctx, path, authorize)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	l, err := net.Listen("tcp", net.JoinHostPort(ip, fmt.Sprint(port)))
+	if err != nil {
+		return fmt.Errorf("listen on Tailscale address (requires the OS TUN interface): %w", err)
+	}
+	defer l.Close()
+	ctx, stop := waitForReceiver(ctx, timeout, s.Started())
+	defer stop()
+	fmt.Fprintf(os.Stderr, "Offering %q (%d bytes, resumable) to %q [%s] only.\n", s.Offer.Name, s.Offer.Size, peer.DNSName, peer.ID)
+	fmt.Fprintf(os.Stderr, "On that host run: tailbeam receive --port %d %s\n", port, status.Self.ID)
+	if err := transfer.ServeV2(ctx, l, s); err != nil {
+		return serveErr(ctx, err, timeout)
+	}
+	fmt.Fprintln(os.Stderr, "Receiver acknowledged the saved file.")
+	return nil
+}
+
 type candidate struct {
 	peer   *tailnet.Node
-	offer  transfer.Offer
+	offer  transfer.Remote
 	client *http.Client
 	base   string
 }
@@ -227,7 +269,7 @@ func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, hos
 				}
 			}
 			fmt.Fprintf(os.Stderr, "Receiving %q (%d bytes) from %q [%s].\n", c.offer.Name, c.offer.Size, c.peer.DNSName, c.peer.ID)
-			path, err := transfer.DownloadIdle(parent, c.client, c.base, c.offer, dir, max, idle)
+			path, err := c.offer.Download(parent, c.client, c.base, c.peer.ID, dir, max, idle)
 			if err != nil {
 				return err
 			}
@@ -265,9 +307,9 @@ func discover(ctx context.Context, b tailnet.Backend, peers []*tailnet.Node, por
 			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			c, base, err := transfer.Client(b, p, port)
-			var o transfer.Offer
+			var o transfer.Remote
 			if err == nil {
-				o, err = transfer.FetchOffer(probeCtx, c, base)
+				o, err = transfer.FetchAnyOffer(probeCtx, c, base)
 			}
 			mu.Lock()
 			defer mu.Unlock()

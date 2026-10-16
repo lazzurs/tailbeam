@@ -43,15 +43,23 @@ when no bytes arrive for that long; the sender likewise drops a connection that
 makes no write progress for 60 seconds. `--deadline` (default 0, none) is an
 optional absolute cap on the whole command. The sender remains running until the
 receiver acknowledges the saved file or it is canceled. An interrupted or stalled
-download can be retried immediately while the offer is still running; it restarts
-from byte zero. Keep the source file unchanged until completion.
+download can be retried immediately while the offer is still running. Keep the
+source file unchanged until completion.
+
+Transfers use [protocol v2](docs/protocol-v2.md): the file is verified in
+chunks, and an interrupted download resumes from its verified chunks when you
+run `receive` again into the same directory, even if either side was restarted.
+Partial state lives in private `.tailbeam-v2-*.part` and `.state` files beside
+the destination. If the source changes, the partial state is discarded. A new
+receiver also accepts offers from v1 senders; for a receiver older than v2, run
+`send --v1` (v1 restarts from byte zero).
 
 Before downloading, `receive` shows the sender (name and stable ID), the quoted
 file name, and the size, and asks `Accept? [y/N]`; anything but `y`/`yes`
 declines, with a nonzero exit and no download or acknowledgement. `--yes` skips
 the prompt. Without a terminal on stdin and without `--yes`, it refuses to run.
-Free space in the output directory is checked first (Linux), and the temporary
-file is preallocated so a full disk fails early.
+Free space for the bytes still missing is checked first (Linux), and the
+partial file is preallocated so a full disk fails early.
 
 File names must not start with `.`, and must be valid UTF-8 made only of
 printable characters: control, C1, Unicode format (bidi overrides, zero-width),
@@ -174,5 +182,5 @@ For a live smoke test, build on two Tailscale hosts, allow receiver-to-sender TC
 third host: it should get no offer metadata or file bytes, even if policy permits
 the connection. Repeat with the daemon stopped and an existing destination file;
 both operations should fail safely. Test one transfer per sender/port; use a
-different `--port` for concurrent offers. There is no persistence, resume offset,
-directory/archive handling, compression, or background queue in this version.
+different `--port` for concurrent offers. There is no directory/archive
+handling, compression, parallel streaming, or background queue in this version.
