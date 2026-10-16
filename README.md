@@ -35,9 +35,15 @@ tailbeam receive --socket /var/run/tailscale/tailscaled.sock laptop
 
 The output directory must already exist. Default maximum receive size is 1 GiB;
 default total timeout is one hour. The sender remains running until the receiver
-acknowledges the saved file, cancellation, or timeout. An interrupted download
-can be retried while the offer is still running; it restarts from byte zero.
-Keep the source file unchanged until completion.
+acknowledges the saved file, cancellation, or timeout.
+
+Transfers use [protocol v2](docs/protocol-v2.md): the file is verified in
+chunks, and an interrupted download resumes from its verified chunks when you
+run `receive` again into the same directory, even if either side was restarted.
+Partial state lives in private `.tailbeam-v2-*.part` and `.state` files beside
+the destination. If the source changes, the partial state is discarded. A new
+receiver also accepts offers from v1 senders; for a receiver older than v2, run
+`send --v1` (v1 restarts from byte zero).
 
 ## How it works
 
@@ -155,5 +161,5 @@ For a live smoke test, build on two Tailscale hosts, allow receiver-to-sender TC
 third host: it should get no offer metadata or file bytes, even if policy permits
 the connection. Repeat with the daemon stopped and an existing destination file;
 both operations should fail safely. Test one transfer per sender/port; use a
-different `--port` for concurrent offers. There is no persistence, resume offset,
-directory/archive handling, compression, or background queue in this version.
+different `--port` for concurrent offers. There is no directory/archive
+handling, compression, parallel streaming, or background queue in this version.

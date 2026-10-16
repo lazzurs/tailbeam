@@ -28,6 +28,7 @@ running during the transfer. Hosts may be MagicDNS names, Tailscale IPs, or node
 Use receive SENDER to accept offers from only that host. Flags precede arguments.
 
 Common flags: --port 8784 --timeout 1h --socket PATH
+Send flags: --v1 (serve protocol v1 for receivers older than v2)
 Receive flags: --dir . --max-bytes 1073741824
 `
 
@@ -55,6 +56,10 @@ func run(ctx context.Context, args []string) error {
 	socket := fs.String("socket", "", "Tailscale daemon socket (default: LocalAPI platform default)")
 	var dir *string
 	var max *int64
+	v1 := new(bool)
+	if mode == "send" {
+		v1 = fs.Bool("v1", false, "serve protocol v1 (no resume) for older receivers")
+	}
 	if mode == "receive" {
 		dir = fs.String("dir", ".", "existing output directory")
 		max = fs.Int64("max-bytes", 1<<30, "maximum accepted file size")
@@ -82,12 +87,12 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	if mode == "send" {
-		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port)
+		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *v1)
 	}
 	return receive(ctx, b, s, fs.Arg(0), *port, *dir, *max)
 }
 
-func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int) error {
+func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, v1 bool) error {
 	peer, err := tailnet.Resolve(status, host)
 	if err != nil {
 		return err
@@ -96,7 +101,11 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 	if err != nil {
 		return err
 	}
-	s, err := transfer.NewSender(ctx, path, func(ctx context.Context, addr string) error { return tailnet.Verify(ctx, b, addr, peer.ID) })
+	authorize := func(ctx context.Context, addr string) error { return tailnet.Verify(ctx, b, addr, peer.ID) }
+	if !v1 {
+		return sendV2(ctx, status, peer, ip, path, port, authorize)
+	}
+	s, err := transfer.NewSender(ctx, path, authorize)
 	if err != nil {
 		return err
 	}
@@ -115,9 +124,29 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 	return nil
 }
 
+func sendV2(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip, path string, port int, authorize transfer.Authorize) error {
+	s, err := transfer.NewSenderV2(ctx, path, authorize)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	l, err := net.Listen("tcp", net.JoinHostPort(ip, fmt.Sprint(port)))
+	if err != nil {
+		return fmt.Errorf("listen on Tailscale address (requires the OS TUN interface): %w", err)
+	}
+	defer l.Close()
+	fmt.Fprintf(os.Stderr, "Offering %q (%d bytes, resumable) to %q [%s] only.\n", s.Offer.Name, s.Offer.Size, peer.DNSName, peer.ID)
+	fmt.Fprintf(os.Stderr, "On that host run: tailbeam receive --port %d %s\n", port, status.Self.ID)
+	if err := transfer.ServeV2(ctx, l, s); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "Receiver acknowledged the saved file.")
+	return nil
+}
+
 type candidate struct {
 	peer   *tailnet.Node
-	offer  transfer.Offer
+	offer  transfer.Remote
 	client *http.Client
 	base   string
 }
@@ -174,7 +203,7 @@ func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, hos
 			c := found[0]
 			defer c.close()
 			fmt.Fprintf(os.Stderr, "Receiving %q (%d bytes) from %q [%s].\n", c.offer.Name, c.offer.Size, c.peer.DNSName, c.peer.ID)
-			path, err := transfer.Download(ctx, c.client, c.base, c.offer, dir, max)
+			path, err := c.offer.Download(ctx, c.client, c.base, c.peer.ID, dir, max)
 			if err != nil {
 				return err
 			}
@@ -212,9 +241,9 @@ func discover(ctx context.Context, b tailnet.Backend, peers []*tailnet.Node, por
 			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			c, base, err := transfer.Client(b, p, port)
-			var o transfer.Offer
+			var o transfer.Remote
 			if err == nil {
-				o, err = transfer.FetchOffer(probeCtx, c, base)
+				o, err = transfer.FetchAnyOffer(probeCtx, c, base)
 			}
 			mu.Lock()
 			defer mu.Unlock()

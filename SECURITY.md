@@ -36,6 +36,15 @@ processes sharing a node, nor does it pin a human owner independently of that
 node. Tailnet administrators and compromised endpoints remain inside the trust
 boundary. Tagged and shared nodes are subject to the same exact-node test.
 
+## Protocol v2
+
+The default protocol adds a chunk manifest, range reads and on-disk resume
+state. It keeps every v1 gate on every endpoint. Its integrity, resume-file and
+hostile-offer analysis is in [docs/protocol-v2.md](docs/protocol-v2.md).
+Resume files are private, regular-file-only, and discarded unless they match the
+offer's sender, name, size, chunk size and root exactly. The complete partial
+file is re-verified before publication.
+
 ## Protocol v1
 
 * `GET /v1/offer` returns version, random 256-bit offer ID, base filename, size,
