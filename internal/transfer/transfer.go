@@ -17,12 +17,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/linuskendall/tailbeam/internal/tailnet"
 )
 
 const DefaultPort = 8784
 const maxMetadata = 16 << 10
+
+// A stalled sender write fails after this long without progress; every
+// successful write renews it, so slow but live transfers are never cut off.
+const defaultWriteTimeout = 60 * time.Second
 
 // Like Setec, require a forbidden-to-browser-JavaScript Sec-* header. This is
 // defense against browser-based access from an otherwise authorized host,
@@ -45,9 +51,15 @@ type Sender struct {
 	Offer     Offer
 	file      *os.File
 	authorize Authorize
-	mu        sync.Mutex
-	done      chan struct{}
-	complete  bool
+	// mu guards only complete and the ack transition; file streaming is
+	// lock-free (ReadAt is concurrency-safe) so a stuck connection cannot
+	// block a retry.
+	mu           sync.Mutex
+	done         chan struct{}
+	complete     bool
+	started      chan struct{}
+	startOnce    sync.Once
+	writeTimeout time.Duration
 }
 
 func NewSender(ctx context.Context, path string, authorize Authorize) (*Sender, error) {
@@ -87,7 +99,7 @@ func NewSender(ctx context.Context, path string, authorize Authorize) (*Sender, 
 	if _, err := rand.Read(token[:]); err != nil {
 		return nil, err
 	}
-	s := &Sender{Offer: Offer{1, hex.EncodeToString(token[:]), name, n, hex.EncodeToString(h.Sum(nil))}, file: f, authorize: authorize, done: make(chan struct{})}
+	s := &Sender{Offer: Offer{1, hex.EncodeToString(token[:]), name, n, hex.EncodeToString(h.Sum(nil))}, file: f, authorize: authorize, done: make(chan struct{}), started: make(chan struct{}), writeTimeout: defaultWriteTimeout}
 	ok = true
 	return s, nil
 }
@@ -107,6 +119,31 @@ func (r contextReader) Read(b []byte) (int, error) {
 func (s *Sender) Close() error          { return s.file.Close() }
 func (s *Sender) Done() <-chan struct{} { return s.done }
 
+// Started is closed when the first authorized request for file content begins.
+func (s *Sender) Started() <-chan struct{} { return s.started }
+
+func (s *Sender) finished() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.complete
+}
+
+// deadlineWriter renews the connection write deadline after each successful write.
+type deadlineWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+	d  time.Duration
+}
+
+func (w deadlineWriter) Write(b []byte) (int, error) {
+	n, err := w.w.Write(b)
+	if err == nil {
+		// Ignore unsupported-deadline errors; the initial call reported them.
+		w.rc.SetWriteDeadline(time.Now().Add(w.d))
+	}
+	return n, err
+}
+
 func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(browserGuardHeader) != browserGuardValue || r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") != "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -119,12 +156,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if !s.mu.TryLock() {
-		http.Error(w, "transfer busy", http.StatusConflict)
-		return
-	}
-	defer s.mu.Unlock()
-	if s.complete {
+	if s.finished() {
 		http.Error(w, "offer completed", http.StatusGone)
 		return
 	}
@@ -133,11 +165,26 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(s.Offer)
 	case r.Method == "GET" && r.URL.Path == "/v1/file/"+s.Offer.ID:
+		s.startOnce.Do(func() { close(s.started) })
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", fmt.Sprint(s.Offer.Size))
-		io.Copy(w, io.NewSectionReader(s.file, 0, s.Offer.Size))
+		rc := http.NewResponseController(w)
+		rc.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+		dw := deadlineWriter{w, rc, s.writeTimeout}
+		if _, err := io.Copy(dw, io.NewSectionReader(s.file, 0, s.Offer.Size)); err != nil {
+			// Headers are already sent; the client sees a truncated body and
+			// fails its length/hash checks. Returning drops the connection.
+			return
+		}
 	case r.Method == "POST" && r.URL.Path == "/v1/ack/"+s.Offer.ID:
+		s.mu.Lock()
+		if s.complete {
+			s.mu.Unlock()
+			http.Error(w, "offer completed", http.StatusGone)
+			return
+		}
 		s.complete = true
+		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 		// Serve waits for the active handler before closing the connection.
 		close(s.done)
@@ -239,9 +286,19 @@ func validName(name string) error {
 	if name == "" || name == "." || name == ".." || len(name) > 255 || strings.ContainsAny(name, "/\\:") || strings.TrimSpace(name) != name || strings.HasSuffix(name, ".") {
 		return errors.New("unsafe file name")
 	}
+	// Dotfiles (.profile, .envrc, .npmrc) are commonly executed or trusted by tools.
+	if strings.HasPrefix(name, ".") {
+		return errors.New("file name must not start with a dot")
+	}
+	// Invalid UTF-8 would otherwise decode as printable U+FFFD below.
+	if !utf8.ValidString(name) {
+		return errors.New("file name is not valid UTF-8")
+	}
+	// NFC normalization is not enforced: golang.org/x/text is not a dependency.
 	for _, r := range name {
-		if r < 32 || r == 127 {
-			return errors.New("control character in file name")
+		// IsPrint already excludes Cf and C1; the checks are explicit for clarity.
+		if r < 32 || r == 127 || (r >= 0x80 && r <= 0x9f) || unicode.Is(unicode.Cf, r) || !unicode.IsPrint(r) {
+			return errors.New("control, format, or non-printable character in file name")
 		}
 	}
 	// Avoid Windows device names even when the sender runs on Unix.
@@ -269,6 +326,29 @@ func validateOffer(o Offer) error {
 // file into place gives atomic no-replace semantics, including against symlinks.
 // The output directory must be trusted and must support hard links.
 func Download(ctx context.Context, c *http.Client, base string, o Offer, dir string, maxBytes int64) (string, error) {
+	return DownloadIdle(ctx, c, base, o, dir, maxBytes, 0)
+}
+
+var errIdle = errors.New("idle timeout")
+
+// idleReader cancels the request when no bytes arrive for the idle duration.
+type idleReader struct {
+	r     io.Reader
+	timer *time.Timer
+	d     time.Duration
+}
+
+func (r idleReader) Read(b []byte) (int, error) {
+	n, err := r.r.Read(b)
+	if n > 0 {
+		r.timer.Reset(r.d)
+	}
+	return n, err
+}
+
+// DownloadIdle is Download with an idle watchdog: if idle > 0 and no response
+// bytes arrive for that long, the request is canceled. There is no total cap.
+func DownloadIdle(ctx context.Context, c *http.Client, base string, o Offer, dir string, maxBytes int64, idle time.Duration) (string, error) {
 	if err := validateOffer(o); err != nil {
 		return "", err
 	}
@@ -281,25 +361,51 @@ func Download(ctx context.Context, c *http.Client, base string, o Offer, dir str
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
+	if free, ok, err := freeSpace(dir); err != nil {
+		return "", err
+	} else if ok && uint64(o.Size) > free {
+		return "", fmt.Errorf("not enough free space in %s: need %d bytes, have %d", dir, o.Size, free)
+	}
 	f, err := os.CreateTemp(dir, ".tailbeam-*")
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(f.Name())
 	defer f.Close()
-	r, err := request(ctx, c, "GET", base+"/v1/file/"+o.ID)
-	if err != nil {
+	if err := preallocate(f, o.Size); err != nil {
+		return "", fmt.Errorf("preallocate: %w", err)
+	}
+	reqCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var timer *time.Timer
+	if idle > 0 {
+		timer = time.AfterFunc(idle, func() { cancel(errIdle) })
+		defer timer.Stop()
+	}
+	fail := func(err error) (string, error) {
+		if errors.Is(context.Cause(reqCtx), errIdle) {
+			return "", fmt.Errorf("no data received for %s: %w", idle, errIdle)
+		}
 		return "", err
 	}
+	r, err := request(reqCtx, c, "GET", base+"/v1/file/"+o.ID)
+	if err != nil {
+		return fail(err)
+	}
 	defer r.Body.Close()
+	var body io.Reader = r.Body
+	if timer != nil {
+		timer.Reset(idle)
+		body = idleReader{r.Body, timer, idle}
+	}
 	h := sha256.New()
 	// CopyN followed by a one-byte read avoids size+1 overflow for hostile offers.
-	_, err = io.CopyN(io.MultiWriter(f, h), r.Body, o.Size)
+	_, err = io.CopyN(io.MultiWriter(f, h), body, o.Size)
 	if err != nil {
-		return "", fmt.Errorf("incomplete download: %w", err)
+		return fail(fmt.Errorf("incomplete download: %w", err))
 	}
 	var extra [1]byte
-	n, err := r.Body.Read(extra[:])
+	n, err := body.Read(extra[:])
 	if n != 0 || err != io.EOF {
 		return "", errors.New("download length does not match offer")
 	}
@@ -314,6 +420,9 @@ func Download(ctx context.Context, c *http.Client, base string, o Offer, dir str
 	}
 	if err = os.Link(f.Name(), dest); err != nil {
 		return "", fmt.Errorf("publish without overwrite: %w", err)
+	}
+	if err = syncDir(dir); err != nil {
+		return dest, fmt.Errorf("file saved at %s, but directory sync failed: %w", dest, err)
 	}
 	ack, err := request(ctx, c, "POST", base+"/v1/ack/"+o.ID)
 	if err != nil {

@@ -55,13 +55,23 @@ Unauthorized requests receive a generic 403 without transfer metadata.
 Only regular source files are offered. Source data is hashed before serving;
 modification after hashing causes verification failure rather than a valid
 download. Do not modify the source during a transfer. Memory use is streaming,
-independent of file size. Receive defaults to a 1 GiB limit and one-hour total
-timeout. Metadata and HTTP headers are bounded, discovery concurrency is limited,
+independent of file size. Receive defaults to a 1 GiB limit. `--timeout` (one hour) bounds only waiting for
+a peer; active transfers are bounded by a receiver idle timeout (`--idle-timeout`,
+5m, no bytes received) and a sender per-write deadline (60s, renewed on every
+successful write), plus an optional absolute `--deadline`. The sender serves the
+offer and file without an exclusive lock, so a black-holed connection cannot block
+a retry; only the completion flag is mutex-guarded, and completed offers return
+410 on every endpoint. Metadata and HTTP headers are bounded, discovery concurrency is limited,
 and request headers have a deadline. The normal OS/Tailscale network stack and
 local daemon still need operational protection against connection floods.
 
-Filenames reject traversal, separators, control characters, drive prefixes, and
-common Windows device names. The receiver uses a private temporary file and an
+Filenames reject traversal, separators, leading dots (planted dotfiles such as
+.profile or .envrc), invalid UTF-8, control, C1, Unicode format (bidi override,
+zero-width) and other non-printable characters, drive prefixes, and common Windows
+device names. NFC normalization is not enforced. Before any download, the
+receiver displays sender, quoted name, and size and requires explicit
+confirmation (`--yes` to skip; no terminal and no `--yes` is an error), so a
+peer with node access cannot silently write files. The receiver uses a private temporary file and an
 atomic hard-link publication, so a concurrently created file or symlink cannot
 be overwritten. The output directory and its ancestors must be controlled by the
 receiving user; defending against a malicious local user replacing those
@@ -70,8 +80,9 @@ Windows ACL policy. Users must choose a suitably restricted output directory.
 
 Temporary downloads are removed on normal error and cancellation paths. A forced
 kill or power loss can leave a private `.tailbeam-*` file; remove it manually.
-Files are synced before publication, but the directory entry is not explicitly
-synced, so acknowledgement is not a guarantee against a subsequent power loss.
+Files are synced before publication and the output directory is synced (Unix)
+after linking and before acknowledgement; Windows does not sync the directory.
+On Linux, free space is checked and the temporary file is preallocated.
 There is no automatic deletion of source files. Disk exhaustion and unsupported
 hard links produce errors. A verified final file is retained if acknowledgement
 fails; retrying into the same filename is deliberately rejected.

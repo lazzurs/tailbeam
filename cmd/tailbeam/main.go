@@ -27,8 +27,15 @@ Start send first, then run receive on the destination. Both commands must remain
 running during the transfer. Hosts may be MagicDNS names, Tailscale IPs, or node IDs.
 Use receive SENDER to accept offers from only that host. Flags precede arguments.
 
-Common flags: --port 8784 --timeout 1h --socket PATH
-Receive flags: --dir . --max-bytes 1073741824
+Common flags: --port 8784 --timeout 1h --deadline 0 --socket PATH
+  --timeout   how long to wait for a peer (send: until the receiver starts
+              downloading; receive: until an offer is found)
+  --deadline  absolute cap on the whole command, including an active transfer
+              (default 0 = none)
+Receive flags: --dir . --max-bytes 1073741824 --idle-timeout 5m --yes
+  --idle-timeout  abort a download when no bytes arrive for this long
+  --yes           accept without the interactive confirmation prompt
+receive asks "Accept? [y/N]" on the terminal; without a terminal it requires --yes.
 `
 
 func main() {
@@ -51,11 +58,16 @@ func run(ctx context.Context, args []string) error {
 	}
 	fs := flag.NewFlagSet(mode, flag.ContinueOnError)
 	port := fs.Int("port", transfer.DefaultPort, "TCP port on the sender")
-	timeout := fs.Duration("timeout", time.Hour, "maximum total waiting and transfer time")
+	timeout := fs.Duration("timeout", time.Hour, "maximum time waiting for a peer; does not limit an active transfer")
+	deadline := fs.Duration("deadline", 0, "absolute cap on the whole command (0 = none)")
 	socket := fs.String("socket", "", "Tailscale daemon socket (default: LocalAPI platform default)")
 	var dir *string
 	var max *int64
+	var idle *time.Duration
+	var yes *bool
 	if mode == "receive" {
+		idle = fs.Duration("idle-timeout", 5*time.Minute, "abort a download when no bytes arrive for this long")
+		yes = fs.Bool("yes", false, "skip the confirmation prompt")
 		dir = fs.String("dir", ".", "existing output directory")
 		max = fs.Int64("max-bytes", 1<<30, "maximum accepted file size")
 	}
@@ -65,8 +77,8 @@ func run(ctx context.Context, args []string) error {
 		}
 		return err
 	}
-	if *port < 1 || *port > 65535 || *timeout <= 0 {
-		return errors.New("port must be 1..65535 and timeout must be positive")
+	if *port < 1 || *port > 65535 || *timeout <= 0 || *deadline < 0 || (idle != nil && *idle <= 0) {
+		return errors.New("port must be 1..65535, timeouts must be positive, and deadline nonnegative")
 	}
 	if (mode == "send" && fs.NArg() != 2) || (mode == "receive" && fs.NArg() > 1) {
 		return errors.New("usage: " + usage)
@@ -74,20 +86,28 @@ func run(ctx context.Context, args []string) error {
 	if max != nil && *max < 0 {
 		return errors.New("max-bytes must be nonnegative")
 	}
-	ctx, cancel := context.WithTimeout(ctx, *timeout)
-	defer cancel()
+	if mode == "receive" && !*yes && !isTerminal(os.Stdin) {
+		return errors.New("stdin is not a terminal; pass --yes to receive without confirmation")
+	}
+	if *deadline > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *deadline)
+		defer cancel()
+	}
 	b := tailnet.NewLocal(*socket)
-	s, err := b.Status(ctx)
+	sctx, scancel := context.WithTimeout(ctx, *timeout)
+	s, err := b.Status(sctx)
+	scancel()
 	if err != nil {
 		return err
 	}
 	if mode == "send" {
-		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port)
+		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout)
 	}
-	return receive(ctx, b, s, fs.Arg(0), *port, *dir, *max)
+	return receive(ctx, b, s, fs.Arg(0), *port, *dir, *max, *timeout, *idle, *yes)
 }
 
-func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int) error {
+func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration) error {
 	peer, err := tailnet.Resolve(status, host)
 	if err != nil {
 		return err
@@ -106,14 +126,32 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 		return fmt.Errorf("listen on Tailscale address (requires the OS TUN interface): %w", err)
 	}
 	defer l.Close()
+	// --timeout bounds only the wait for a receiver; once the first file request
+	// begins, the sender's per-write deadline handles stalls.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	wait := time.AfterFunc(timeout, func() { cancel(errWaitTimeout) })
+	defer wait.Stop()
+	go func() {
+		select {
+		case <-s.Started():
+			wait.Stop()
+		case <-ctx.Done():
+		}
+	}()
 	fmt.Fprintf(os.Stderr, "Offering %q (%d bytes) to %q [%s] only.\n", s.Offer.Name, s.Offer.Size, peer.DNSName, peer.ID)
 	fmt.Fprintf(os.Stderr, "On that host run: tailbeam receive --port %d %s\n", port, status.Self.ID)
 	if err := transfer.Serve(ctx, l, s); err != nil {
+		if errors.Is(context.Cause(ctx), errWaitTimeout) {
+			return fmt.Errorf("timed out after %s waiting for the receiver", timeout)
+		}
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Receiver acknowledged the saved file.")
 	return nil
 }
+
+var errWaitTimeout = errors.New("wait timeout")
 
 type candidate struct {
 	peer   *tailnet.Node
@@ -124,7 +162,7 @@ type candidate struct {
 
 func (c candidate) close() { c.client.CloseIdleConnections() }
 
-func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, host string, port int, dir string, max int64) error {
+func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, host string, port int, dir string, max int64, timeout, idle time.Duration, yes bool) error {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return err
@@ -139,6 +177,11 @@ func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, hos
 			return err
 		}
 	}
+	// --timeout bounds discovery only; the transfer itself is bounded by the
+	// idle timeout (and --deadline, if set, via parent).
+	parent := ctx
+	ctx, stopWait := context.WithTimeout(ctx, timeout)
+	defer stopWait()
 	fmt.Fprintln(os.Stderr, "Waiting for an authorized offer…")
 	var lastErr error
 	for {
@@ -173,8 +216,18 @@ func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, hos
 		if len(found) == 1 {
 			c := found[0]
 			defer c.close()
+			stopWait()
+			if !yes {
+				ok, err := accept(parent, os.Stdin, os.Stderr, c.peer.DNSName, c.peer.ID, c.offer.Name, c.offer.Size)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return errors.New("transfer declined")
+				}
+			}
 			fmt.Fprintf(os.Stderr, "Receiving %q (%d bytes) from %q [%s].\n", c.offer.Name, c.offer.Size, c.peer.DNSName, c.peer.ID)
-			path, err := transfer.Download(ctx, c.client, c.base, c.offer, dir, max)
+			path, err := transfer.DownloadIdle(parent, c.client, c.base, c.offer, dir, max, idle)
 			if err != nil {
 				return err
 			}

@@ -28,16 +28,35 @@ Flags go **before** positional arguments:
 
 ```sh
 tailbeam send --timeout 20m --port 8784 ./archive.tar.gz desktop
-tailbeam receive --timeout 20m --port 8784 --dir ./downloads --max-bytes 5368709120 laptop
+tailbeam receive --timeout 20m --idle-timeout 5m --port 8784 --dir ./downloads --max-bytes 5368709120 laptop
+# Non-interactive receive (stdin is not a terminal) requires --yes:
+tailbeam receive --yes laptop
 # A custom daemon socket, if needed:
 tailbeam receive --socket /var/run/tailscale/tailscaled.sock laptop
 ```
 
 The output directory must already exist. Default maximum receive size is 1 GiB;
-default total timeout is one hour. The sender remains running until the receiver
-acknowledges the saved file, cancellation, or timeout. An interrupted download
-can be retried while the offer is still running; it restarts from byte zero.
-Keep the source file unchanged until completion.
+`--timeout` (default one hour) bounds only *waiting*: discovery on the receiver,
+and on the sender the wait until a receiver starts downloading. It never cuts
+off an active transfer. `--idle-timeout` (default 5m, receiver) aborts a download
+when no bytes arrive for that long; the sender likewise drops a connection that
+makes no write progress for 60 seconds. `--deadline` (default 0, none) is an
+optional absolute cap on the whole command. The sender remains running until the
+receiver acknowledges the saved file or it is canceled. An interrupted or stalled
+download can be retried immediately while the offer is still running; it restarts
+from byte zero. Keep the source file unchanged until completion.
+
+Before downloading, `receive` shows the sender (name and stable ID), the quoted
+file name, and the size, and asks `Accept? [y/N]`; anything but `y`/`yes`
+declines, with a nonzero exit and no download or acknowledgement. `--yes` skips
+the prompt. Without a terminal on stdin and without `--yes`, it refuses to run.
+Free space in the output directory is checked first (Linux), and the temporary
+file is preallocated so a full disk fails early.
+
+File names must not start with `.`, and must be valid UTF-8 made only of
+printable characters: control, C1, Unicode format (bidi overrides, zero-width),
+and other non-printing characters are rejected, by sender and receiver alike.
+NFC normalization is not required (it would need `golang.org/x/text`).
 
 ## How it works
 
