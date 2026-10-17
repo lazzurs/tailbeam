@@ -56,14 +56,17 @@ func senderV2(t *testing.T, path string, auth Authorize) *SenderV2 {
 // tap wraps a sender, counting file bytes served and optionally corrupting or
 // cutting responses.
 type tap struct {
-	h       http.Handler
-	served  atomic.Int64
-	mu      sync.Mutex
-	reqs    int
-	flip    func(req int) int64 // body offset to corrupt, or -1
-	cutAt   int64               // stop the first file response after this many bytes
-	onCut   func()
-	cutDone bool
+	h      http.Handler
+	served atomic.Int64
+	mu     sync.Mutex
+	reqs   int
+	flip   func(req int) int64 // body offset to corrupt, or -1
+	cutAt  int64               // break the response that crosses this many file bytes served in total
+	// failAfterCut answers every later file request with 503, as if the
+	// sender had gone away, so the download fails with the data it had
+	// received so far on disk.
+	failAfterCut bool
+	cutDone      bool
 }
 
 type tapWriter struct {
@@ -71,7 +74,18 @@ type tapWriter struct {
 	t      *tap
 	n      int64
 	flipAt int64
-	cut    int64
+}
+
+// cut reports how many of the next k bytes may still be written before the
+// tap's one-time cut point, or -1 if the cut does not fall within them.
+func (t *tap) cut(k int64) int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.cutAt <= 0 || t.cutDone || t.served.Load()+k <= t.cutAt {
+		return -1
+	}
+	t.cutDone = true
+	return max(0, t.cutAt-t.served.Load())
 }
 
 func (w *tapWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -81,14 +95,10 @@ func (w *tapWriter) Write(p []byte) (int, error) {
 	if w.flipAt >= w.n && w.flipAt < w.n+int64(len(p)) {
 		p[w.flipAt-w.n] ^= 0xff
 	}
-	if w.cut > 0 && w.n+int64(len(p)) > w.cut {
-		k := w.cut - w.n
+	if k := w.t.cut(int64(len(p))); k >= 0 {
 		w.ResponseWriter.Write(p[:k])
 		w.n += k
 		w.t.served.Add(k)
-		if w.t.onCut != nil {
-			w.t.onCut()
-		}
 		return int(k), errors.New("cut")
 	}
 	n, err := w.ResponseWriter.Write(p)
@@ -103,14 +113,16 @@ func (t *tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t.mu.Lock()
+	if t.failAfterCut && t.cutDone {
+		t.mu.Unlock()
+		http.Error(w, "gone", http.StatusServiceUnavailable)
+		return
+	}
 	req := t.reqs
 	t.reqs++
 	tw := &tapWriter{ResponseWriter: w, t: t, flipAt: -1}
 	if t.flip != nil {
 		tw.flipAt = t.flip(req)
-	}
-	if t.cutAt > 0 && !t.cutDone {
-		tw.cut, t.cutDone = t.cutAt, true
 	}
 	t.mu.Unlock()
 	t.h.ServeHTTP(tw, r)
@@ -219,16 +231,14 @@ func TestV2DroppedConnectionResumesWithinRun(t *testing.T) {
 	}
 }
 
-// interrupted runs a download that is cancelled half way, as if the receiver
-// were killed, and leaves the partial state in dir.
+// interrupted runs a download whose sender goes away half way, and leaves the
+// partial state in dir.
 func interrupted(t *testing.T, path, dir string) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	s := senderV2(t, path, allow)
 	st, _ := os.Stat(path)
-	tp := &tap{h: s, cutAt: st.Size() / 2, onCut: cancel}
-	if _, err := download(t, ctx, tp, dir); err == nil {
+	tp := &tap{h: s, cutAt: st.Size() / 2, failAfterCut: true}
+	if _, err := download(t, context.Background(), tp, dir); err == nil {
 		t.Fatal("interrupted download succeeded")
 	}
 	part, state := V2PartialPaths(dir, testSender, "example.bin")
@@ -327,7 +337,7 @@ func TestV2PersistentCorruptionFails(t *testing.T) {
 	}
 }
 
-func TestV2CorruptPartialFileCaughtByFinalCheck(t *testing.T) {
+func TestV2CorruptPartialFileCaughtOnResume(t *testing.T) {
 	data := randomData(20*testChunk, 8)
 	src := writeSource(t, data)
 	dir := t.TempDir()
@@ -337,7 +347,7 @@ func TestV2CorruptPartialFileCaughtByFinalCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.WriteAt([]byte("garbage"), 10) // chunk 0 is marked verified
+	f.WriteAt([]byte("garbage"), 10) // chunk 0 was written by the first run
 	f.Close()
 	path, err := download(t, context.Background(), senderV2(t, src, allow), dir)
 	if err != nil {
@@ -346,6 +356,136 @@ func TestV2CorruptPartialFileCaughtByFinalCheck(t *testing.T) {
 	got, _ := os.ReadFile(path)
 	if !bytes.Equal(got, data) {
 		t.Fatal("published a corrupted partial file")
+	}
+}
+
+// TestV2ResumeRehashesPartialFile builds a partial file by hand: correct
+// chunks, a corrupted chunk, a hole and unwritten tail, as a killed receiver
+// might leave it with nothing recorded about which writes completed. A resume
+// must keep exactly the chunks that hash-match and fetch only the rest.
+func TestV2ResumeRehashesPartialFile(t *testing.T) {
+	data := randomData(10*testChunk+3, 11)
+	src := writeSource(t, data)
+	s := senderV2(t, src, allow)
+	dir := t.TempDir()
+	part, state := V2PartialPaths(dir, testSender, "example.bin")
+	o := s.Offer
+	if err := (&v2State{1, testSender, o.Name, o.Size, o.ChunkSize, o.Root}).save(state); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(part, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Truncate(o.Size)
+	chunk := func(i int) []byte { return data[i*testChunk : min(len(data), (i+1)*testChunk)] }
+	for _, i := range []int{0, 1, 2, 5, 6} {
+		f.WriteAt(chunk(i), int64(i)*testChunk)
+	}
+	bad := bytes.Clone(chunk(6))
+	bad[100] ^= 1
+	f.WriteAt(bad, 6*testChunk)
+	f.Close()
+
+	tp := &tap{h: s}
+	path, err := download(t, context.Background(), tp, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, data) {
+		t.Fatal("mismatch after resume")
+	}
+	// Chunks 0, 1, 2 and 5 are kept; 3, 4, 6 (corrupt) and 7..10 are fetched.
+	if want := int64(len(data) - 4*testChunk); tp.served.Load() != want {
+		t.Fatalf("served %d bytes, want %d", tp.served.Load(), want)
+	}
+	onlyEntry(t, dir, "example.bin")
+}
+
+// TestV2ParallelStreams checks that a download really uses several
+// concurrent range requests and still fetches each byte once.
+func TestV2ParallelStreams(t *testing.T) {
+	data := randomData(32*testChunk+9, 12)
+	g := &gate{h: senderV2(t, writeSource(t, data), allow)}
+	ts := httptest.NewServer(g)
+	defer ts.Close()
+	r, err := FetchAnyOffer(context.Background(), ts.Client(), ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Streams = 4
+	path, err := r.Download(context.Background(), ts.Client(), ts.URL, testSender, t.TempDir(), 1<<40, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, data) {
+		t.Fatal("mismatch")
+	}
+	if g.peak.Load() < 2 {
+		t.Fatalf("peak concurrent file requests %d, want several", g.peak.Load())
+	}
+	if g.served.Load() != int64(len(data)) {
+		t.Fatalf("served %d bytes for %d", g.served.Load(), len(data))
+	}
+}
+
+// gate holds each file request until a second one arrives (or briefly), so
+// the test can observe concurrency, and counts bytes served.
+type gate struct {
+	h      http.Handler
+	active atomic.Int64
+	peak   atomic.Int64
+	served atomic.Int64
+}
+
+func (g *gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !strings.HasPrefix(r.URL.Path, "/v2/file/") {
+		g.h.ServeHTTP(w, r)
+		return
+	}
+	n := g.active.Add(1)
+	defer g.active.Add(-1)
+	for p := g.peak.Load(); n > p && !g.peak.CompareAndSwap(p, n); p = g.peak.Load() {
+	}
+	for i := 0; i < 100 && g.active.Load() < 2; i++ {
+		time.Sleep(time.Millisecond)
+	}
+	rec := httptest.NewRecorder()
+	g.h.ServeHTTP(rec, r)
+	for k, v := range rec.Header() {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(rec.Code)
+	n2, _ := w.Write(rec.Body.Bytes())
+	g.served.Add(int64(n2))
+}
+
+func TestDataRegions(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "sparse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	const size = 64 << 20
+	f.Truncate(size)
+	f.WriteAt([]byte("data"), 40<<20)
+	regions, ok := dataRegions(f, size)
+	if !ok {
+		t.Skip("filesystem cannot report holes")
+	}
+	var covered int64
+	found := false
+	for _, r := range regions {
+		covered += r[1] - r[0]
+		if r[0] <= 40<<20 && 40<<20+4 <= r[1] {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("written data not in regions %v", regions)
+	}
+	if covered == size {
+		t.Skip("filesystem reports the whole sparse file as data")
 	}
 }
 
@@ -578,16 +718,16 @@ func TestV2GatesOnEveryEndpoint(t *testing.T) {
 
 func TestV2StateRejectsMismatch(t *testing.T) {
 	o := OfferV2{2, strings.Repeat("a", 64), "x.bin", 3 * testChunk, testChunk, v2Hash, strings.Repeat("b", 64)}
-	s := v2State{1, testSender, o.Name, o.Size, o.ChunkSize, o.Root, make([]byte, 1)}
+	s := v2State{1, testSender, o.Name, o.Size, o.ChunkSize, o.Root}
 	if !s.matches(o, testSender) {
 		t.Fatal("matching state rejected")
 	}
 	for name, mut := range map[string]func(*v2State){
-		"sender": func(s *v2State) { s.Sender = "nOther" },
-		"root":   func(s *v2State) { s.Root = strings.Repeat("c", 64) },
-		"size":   func(s *v2State) { s.Size++ },
-		"bitmap": func(s *v2State) { s.Done = make([]byte, 2) },
-		"chunk":  func(s *v2State) { s.ChunkSize *= 2 },
+		"sender":  func(s *v2State) { s.Sender = "nOther" },
+		"root":    func(s *v2State) { s.Root = strings.Repeat("c", 64) },
+		"size":    func(s *v2State) { s.Size++ },
+		"version": func(s *v2State) { s.Version = 2 },
+		"chunk":   func(s *v2State) { s.ChunkSize *= 2 },
 	} {
 		c := s
 		mut(&c)

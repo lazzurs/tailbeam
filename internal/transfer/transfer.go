@@ -226,6 +226,7 @@ func newClient(b tailnet.Backend, peer *tailnet.Node, port int, dial func(contex
 		Proxy:                  nil,
 		ResponseHeaderTimeout:  10 * time.Second,
 		IdleConnTimeout:        10 * time.Second,
+		MaxIdleConnsPerHost:    v2MaxReads, // keep parallel streams' connections (and their identity checks)
 		MaxResponseHeaderBytes: 16 << 10,
 		DialContext: func(ctx context.Context, network, target string) (net.Conn, error) {
 			if target != addr {

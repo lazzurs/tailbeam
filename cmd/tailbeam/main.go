@@ -46,6 +46,7 @@ Receive flags: --dir . --max-bytes 1073741824 --idle-timeout 5m --yes
   --idle-timeout  abort a download when no bytes arrive for this long; an
                   interrupted download resumes when receive is rerun
   --yes           accept without the interactive confirmation prompt
+  --streams       parallel range requests per download, 1..8 (default 2)
 receive asks "Accept? [y/N]" on the terminal; without a terminal it requires --yes.
 `
 
@@ -77,6 +78,7 @@ func run(ctx context.Context, args []string) error {
 	var max *int64
 	var idle *time.Duration
 	var yes *bool
+	streams := new(int)
 	v1 := new(bool)
 	if mode == "send" {
 		v1 = fs.Bool("v1", false, "with --plaintext: serve protocol v1 (no resume) for older receivers")
@@ -86,6 +88,7 @@ func run(ctx context.Context, args []string) error {
 		yes = fs.Bool("yes", false, "skip the confirmation prompt")
 		dir = fs.String("dir", ".", "existing output directory")
 		max = fs.Int64("max-bytes", 1<<30, "maximum accepted file size")
+		streams = fs.Int("streams", transfer.DefaultStreams, "parallel range requests per download, 1..8")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -95,6 +98,9 @@ func run(ctx context.Context, args []string) error {
 	}
 	if *port < 1 || *port > 65535 || *timeout <= 0 || *deadline < 0 || (idle != nil && *idle <= 0) {
 		return errors.New("port must be 1..65535, timeouts must be positive, and deadline nonnegative")
+	}
+	if mode == "receive" && (*streams < 1 || *streams > 8) {
+		return errors.New("streams must be 1..8")
 	}
 	if (mode == "send" && fs.NArg() != 2) || (mode == "receive" && fs.NArg() > 1) {
 		return errors.New("usage: " + usage)
@@ -142,7 +148,7 @@ func run(ctx context.Context, args []string) error {
 	if mode == "send" {
 		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout, *plaintext, *v1)
 	}
-	return receive(ctx, b, s, host, code, *port, *dir, *max, *timeout, *idle, *yes)
+	return receive(ctx, b, s, host, code, *port, *dir, *max, *timeout, *idle, *yes, *streams)
 }
 
 func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration, plaintext, v1 bool) error {
@@ -272,7 +278,7 @@ type candidate struct {
 	name     string
 	size     int64
 	client   *http.Client
-	download func(ctx context.Context, dir string, max int64, idle time.Duration) (string, error)
+	download func(ctx context.Context, dir string, max int64, idle time.Duration, streams int) (string, error)
 }
 
 func (c candidate) close() { c.client.CloseIdleConnections() }
@@ -285,7 +291,8 @@ func plaintextProbe(ctx context.Context, c *http.Client, base string, p *tailnet
 	if err != nil {
 		return candidate{}, err
 	}
-	return candidate{p, r.Name, r.Size, c, func(ctx context.Context, dir string, max int64, idle time.Duration) (string, error) {
+	return candidate{p, r.Name, r.Size, c, func(ctx context.Context, dir string, max int64, idle time.Duration, streams int) (string, error) {
+		r.Streams = streams
 		return r.Download(ctx, c, base, p.ID, dir, max, idle)
 	}}, nil
 }
@@ -296,13 +303,14 @@ func e2eProbe(code e2e.Code, self string) probe {
 		if err != nil {
 			return candidate{}, err
 		}
-		return candidate{p, o.Name, o.Size, c, func(ctx context.Context, dir string, max int64, idle time.Duration) (string, error) {
+		return candidate{p, o.Name, o.Size, c, func(ctx context.Context, dir string, max int64, idle time.Duration, streams int) (string, error) {
+			o.Streams = streams
 			return o.Download(ctx, c, base, p.ID, dir, max, idle)
 		}}, nil
 	}
 }
 
-func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, host string, code *e2e.Code, port int, dir string, max int64, timeout, idle time.Duration, yes bool) error {
+func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, host string, code *e2e.Code, port int, dir string, max int64, timeout, idle time.Duration, yes bool, streams int) error {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return err
@@ -374,7 +382,7 @@ func receive(ctx context.Context, b tailnet.Backend, status *tailnet.Status, hos
 				}
 			}
 			fmt.Fprintf(os.Stderr, "Receiving %q (%d bytes, %s) from %q [%s].\n", c.name, c.size, mode, c.peer.DNSName, c.peer.ID)
-			path, err := c.download(parent, dir, max, idle)
+			path, err := c.download(parent, dir, max, idle, streams)
 			if err != nil {
 				return err
 			}

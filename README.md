@@ -65,7 +65,16 @@ verified in chunks, and an interrupted download resumes from its verified chunks
 when you run `receive` again into the same directory, even if either side was
 restarted (a restarted sender prints a new code; use that). Partial state lives
 in private `.tailbeam-v2-*.part` and `.state` files beside the destination. If
-the source changes, the partial state is discarded.
+the source changes, the partial state is discarded. A resume keeps every chunk
+of the partial file that still matches its hash, including chunks written just
+before the receiver was killed.
+
+The receiver fetches over `--streams` parallel connections (default 2, up to
+8). Each stream also verifies (and decrypts) its own chunks, which spreads that
+work over several cores. Two streams were fastest in live tests between a
+low-power Intel N100 VM and a busy Celeron N3160 host: more streams compete
+with `tailscaled` for CPU. Try 4 between faster machines or over long,
+lossy paths.
 
 `--plaintext` must be given on both sides; a mismatch fails with a message
 naming the other side's mode, never a silent fallback. With `--plaintext`, a new

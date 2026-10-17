@@ -18,8 +18,11 @@ import (
 // E2EOffer is an offer received through a completed, confirmed handshake.
 // Name and Size were decrypted from the handshake and are validated.
 type E2EOffer struct {
-	Name    string
-	Size    int64
+	Name string
+	Size int64
+	// Streams is the number of parallel chunk requests; zero means
+	// DefaultStreams.
+	Streams int
 	o       OfferV2
 	sid     string
 	keys    e2e.Keys
@@ -113,15 +116,13 @@ func FetchE2EOffer(ctx context.Context, c *http.Client, base string, code e2e.Co
 // chunks of an earlier attempt (in either mode) with the same sender, name and
 // root. sender is the sender's stable node ID.
 func (e *E2EOffer) Download(ctx context.Context, c *http.Client, base, sender, dir string, maxBytes int64, idle time.Duration) (string, error) {
-	return downloadChunked(ctx, e.o, sender, dir, maxBytes, idle, &e2eSource{e: e, c: c, base: base})
+	return downloadChunked(ctx, e.o, sender, dir, maxBytes, idle, e.Streams, &e2eSource{e: e, c: c, base: base})
 }
 
 type e2eSource struct {
-	e      *E2EOffer
-	c      *http.Client
-	base   string
-	sealed []byte
-	plain  []byte
+	e    *E2EOffer
+	c    *http.Client
+	base string
 }
 
 func (s *e2eSource) url(action string, q url.Values) string {
@@ -167,7 +168,16 @@ func (s *e2eSource) request(ctx context.Context, first, last int64) (io.ReadClos
 	return r.Body, nil
 }
 
-func (s *e2eSource) readChunk(body io.Reader, i, n int64, w io.Writer) error {
+func (s *e2eSource) newReader() chunkReader { return &e2eReader{e: s.e} }
+
+// e2eReader opens sealed chunks with its own buffers, one per stream.
+type e2eReader struct {
+	e      *E2EOffer
+	sealed []byte
+	plain  []byte
+}
+
+func (s *e2eReader) readChunk(body io.Reader, i, n int64, w io.Writer) error {
 	o := s.e.o
 	if s.sealed == nil {
 		s.sealed = make([]byte, o.ChunkSize+e2e.Overhead)

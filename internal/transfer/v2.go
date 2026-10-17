@@ -105,8 +105,21 @@ func v2Root(size, chunk int64, manifest []byte) []byte {
 // v2HashChunks hashes every chunk of f using a bounded worker pool.
 func v2HashChunks(ctx context.Context, f io.ReaderAt, size, chunk int64) ([]byte, error) {
 	o := OfferV2{Size: size, ChunkSize: chunk}
-	count := o.chunks()
-	out := make([]byte, count*v2ChunkHashSize)
+	out := make([]byte, o.chunks()*v2ChunkHashSize)
+	if err := v2HashInto(ctx, f, o, nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// v2HashInto writes the hash of each listed chunk (all chunks when list is
+// nil) to its slot in out, using a bounded worker pool.
+func v2HashInto(ctx context.Context, f io.ReaderAt, o OfferV2, list []int64, out []byte) error {
+	chunk := o.ChunkSize
+	count := int64(len(list))
+	if list == nil {
+		count = o.chunks()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan int64)
@@ -138,7 +151,11 @@ func v2HashChunks(ctx context.Context, f io.ReaderAt, size, chunk int64) ([]byte
 		}()
 	}
 feed:
-	for i := range count {
+	for k := range count {
+		i := k
+		if list != nil {
+			i = list[k]
+		}
 		select {
 		case jobs <- i:
 		case <-ctx.Done():
@@ -148,9 +165,9 @@ feed:
 	close(jobs)
 	wg.Wait()
 	if firstErr != nil {
-		return nil, firstErr
+		return firstErr
 	}
-	return out, ctx.Err()
+	return ctx.Err()
 }
 
 type SenderV2 struct {

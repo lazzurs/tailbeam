@@ -342,7 +342,8 @@ func (s swapChunks) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func TestE2EReorderedChunksRejected(t *testing.T) {
 	code := newCode(t)
 	dir := t.TempDir()
-	h := swapChunks{senderE2E(t, writeSource(t, randomData(4*testChunk, 25)), code, allow)}
+	// 8 chunks: with up to 4 streams every response carries at least two.
+	h := swapChunks{senderE2E(t, writeSource(t, randomData(8*testChunk, 25)), code, allow)}
 	if _, err := downloadE2E(t, context.Background(), h, code, dir); err == nil {
 		t.Fatal("reordered chunks accepted")
 	}
@@ -381,14 +382,12 @@ func TestE2EResumeAcrossReceiverAndSenderRestart(t *testing.T) {
 	src := writeSource(t, data)
 	dir := t.TempDir()
 
-	// First attempt is cut half way and the receiver "dies".
-	ctx, cancel := context.WithCancel(context.Background())
+	// The first sender goes away half way through.
 	first := newCode(t)
-	tp := &tap{h: senderE2E(t, src, first, allow), cutAt: int64(len(data)) / 2, onCut: cancel}
-	if _, err := downloadE2E(t, ctx, tp, first, dir); err == nil {
+	tp := &tap{h: senderE2E(t, src, first, allow), cutAt: int64(len(data)) / 2, failAfterCut: true}
+	if _, err := downloadE2E(t, context.Background(), tp, first, dir); err == nil {
 		t.Fatal("interrupted download succeeded")
 	}
-	cancel()
 	if _, err := os.Lstat(filepath.Join(dir, "example.bin")); err == nil {
 		t.Fatal("published an incomplete file")
 	}
