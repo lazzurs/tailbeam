@@ -46,6 +46,9 @@ func v2Request(ctx context.Context, c *http.Client, method, url, rangeHeader str
 	}
 	if resp.StatusCode != want {
 		resp.Body.Close()
+		if err := modeError(resp, modeE2E); err != nil {
+			return nil, err
+		}
 		return nil, statusError(resp.StatusCode)
 	}
 	return resp, nil
@@ -254,10 +257,65 @@ func openPartial(part, statePath string, o OfferV2, sender string) (*os.File, *v
 	return f, s, nil
 }
 
+// chunkSource is where a chunked download gets its data: plaintext v2 range
+// requests, or sealed chunks in end-to-end mode.
+type chunkSource interface {
+	manifest(ctx context.Context) ([]byte, error)
+	// request opens a response that streams chunks first..last in order.
+	request(ctx context.Context, first, last int64) (io.ReadCloser, error)
+	// readChunk reads chunk i (n plaintext bytes) from body and writes its
+	// plaintext to w. The caller checks the manifest hash.
+	readChunk(body io.Reader, i, n int64, w io.Writer) error
+	ack(ctx context.Context) error
+}
+
+// plainSource is protocol v2 without end-to-end encryption.
+type plainSource struct {
+	c    *http.Client
+	base string
+	o    OfferV2
+	buf  []byte
+}
+
+func (p *plainSource) manifest(ctx context.Context) ([]byte, error) {
+	return fetchManifest(ctx, p.c, p.base, p.o)
+}
+
+func (p *plainSource) request(ctx context.Context, first, last int64) (io.ReadCloser, error) {
+	start, end := first*p.o.ChunkSize, min(p.o.Size, (last+1)*p.o.ChunkSize)
+	r, err := v2Request(ctx, p.c, "GET", p.base+"/v2/file/"+p.o.ID, fmt.Sprintf("bytes=%d-%d", start, end-1), http.StatusPartialContent)
+	if err != nil {
+		return nil, err
+	}
+	if r.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end-1, p.o.Size) || r.ContentLength != end-start {
+		r.Body.Close()
+		return nil, errors.New("peer returned the wrong range")
+	}
+	return r.Body, nil
+}
+
+func (p *plainSource) readChunk(body io.Reader, i, n int64, w io.Writer) error {
+	if p.buf == nil {
+		p.buf = make([]byte, 1<<20)
+	}
+	got, err := io.CopyBuffer(w, io.LimitReader(body, n), p.buf)
+	if err == nil && got != n {
+		err = io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+func (p *plainSource) ack(ctx context.Context) error {
+	r, err := v2Request(ctx, p.c, "POST", p.base+"/v2/ack/"+p.o.ID, "", http.StatusNoContent)
+	if err != nil {
+		return err
+	}
+	return r.Body.Close()
+}
+
 type v2Fetch struct {
 	ctx       context.Context
-	c         *http.Client
-	base      string
+	src       chunkSource
 	o         OfferV2
 	manifest  []byte
 	f         *os.File
@@ -283,29 +341,20 @@ func (d *v2Fetch) run(first, last int64) (bool, error) {
 	defer cancel()
 	t := time.AfterFunc(d.idle, cancel)
 	defer t.Stop()
-	start, end := first*d.o.ChunkSize, min(d.o.Size, (last+1)*d.o.ChunkSize)
-	r, err := v2Request(ctx, d.c, "GET", d.base+"/v2/file/"+d.o.ID, fmt.Sprintf("bytes=%d-%d", start, end-1), http.StatusPartialContent)
+	rc, err := d.src.request(ctx, first, last)
 	if err != nil {
 		return false, err
 	}
-	defer r.Body.Close()
-	if r.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end-1, d.o.Size) || r.ContentLength != end-start {
-		return false, errors.New("peer returned the wrong range")
-	}
+	defer rc.Close()
 	t.Reset(d.idle)
-	body := idleReader{r.Body, t, d.idle}
-	buf := make([]byte, 1<<20)
+	body := idleReader{rc, t, d.idle}
 	h := sha256.New()
 	progressed := false
 	for i := first; i <= last; i++ {
 		n := d.o.chunkLen(i)
 		h.Reset()
-		got, err := io.CopyBuffer(io.MultiWriter(io.NewOffsetWriter(d.f, i*d.o.ChunkSize), h), io.LimitReader(body, n), buf)
-		if err == nil && got != n {
-			err = io.ErrUnexpectedEOF
-		}
-		if err != nil {
-			return progressed, fmt.Errorf("incomplete chunk %d: %w", i, err)
+		if err := d.src.readChunk(body, i, n, io.MultiWriter(io.NewOffsetWriter(d.f, i*d.o.ChunkSize), h)); err != nil {
+			return progressed, fmt.Errorf("chunk %d: %w", i, err)
 		}
 		if !bytes.Equal(h.Sum(nil), d.manifest[i*v2ChunkHashSize:(i+1)*v2ChunkHashSize]) {
 			return progressed, fmt.Errorf("chunk %d does not match the manifest (source changed or corrupted)", i)
@@ -370,6 +419,12 @@ func DownloadV2(ctx context.Context, c *http.Client, base string, o OfferV2, sen
 // DownloadV2Idle is DownloadV2 with a configurable stall timeout per range
 // response; zero uses v2ReadIdle.
 func DownloadV2Idle(ctx context.Context, c *http.Client, base string, o OfferV2, sender, dir string, maxBytes int64, idle time.Duration) (string, error) {
+	return downloadChunked(ctx, o, sender, dir, maxBytes, idle, &plainSource{c: c, base: base, o: o})
+}
+
+// downloadChunked is the shared resume, verify and publish logic for both
+// plaintext v2 and end-to-end encrypted transfers.
+func downloadChunked(ctx context.Context, o OfferV2, sender, dir string, maxBytes int64, idle time.Duration, src chunkSource) (string, error) {
 	if idle <= 0 {
 		idle = v2ReadIdle
 	}
@@ -388,7 +443,7 @@ func DownloadV2Idle(ctx context.Context, c *http.Client, base string, o OfferV2,
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	manifest, err := fetchManifest(ctx, c, base, o)
+	manifest, err := src.manifest(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -412,7 +467,7 @@ func DownloadV2Idle(ctx context.Context, c *http.Client, base string, o OfferV2,
 	if err := preallocate(f, o.Size); err != nil {
 		return "", fmt.Errorf("preallocate: %w", err)
 	}
-	d := &v2Fetch{ctx: ctx, c: c, base: base, o: o, manifest: manifest, f: f, s: s, statePath: statePath, lastSave: time.Now(), idle: idle}
+	d := &v2Fetch{ctx: ctx, src: src, o: o, manifest: manifest, f: f, s: s, statePath: statePath, lastSave: time.Now(), idle: idle}
 	verified := false
 	for round := 0; round < 2 && !verified; round++ {
 		if err := d.fetchMissing(); err != nil {
@@ -449,10 +504,8 @@ func DownloadV2Idle(ctx context.Context, c *http.Client, base string, o OfferV2,
 	if err := syncDir(dir); err != nil {
 		return dest, fmt.Errorf("file saved at %s, but syncing the directory failed: %w", dest, err)
 	}
-	ack, err := v2Request(ctx, c, "POST", base+"/v2/ack/"+o.ID, "", http.StatusNoContent)
-	if err != nil {
+	if err := src.ack(ctx); err != nil {
 		return dest, fmt.Errorf("file saved at %s, but acknowledgement failed: %w", dest, err)
 	}
-	ack.Body.Close()
 	return dest, nil
 }

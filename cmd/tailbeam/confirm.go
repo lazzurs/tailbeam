@@ -8,18 +8,12 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"golang.org/x/term"
 )
 
-// isTerminal reports whether f is an interactive character device. /dev/null is
-// also a character device, so it is excluded explicitly (no x/term dependency).
-func isTerminal(f *os.File) bool {
-	st, err := f.Stat()
-	if err != nil || st.Mode()&os.ModeCharDevice == 0 {
-		return false
-	}
-	null, err := os.Stat(os.DevNull)
-	return err != nil || !os.SameFile(st, null)
-}
+// isTerminal reports whether f is an interactive terminal.
+func isTerminal(f *os.File) bool { return term.IsTerminal(int(f.Fd())) }
 
 // accept shows what is about to be downloaded and reads one line of consent.
 // Only "y" or "yes" (any case) accepts; EOF and everything else decline. The

@@ -9,6 +9,14 @@ and browser defenses are unchanged from v1 and apply to every v2 endpoint.
 Implementation: `internal/transfer/v2.go` (sender) and
 `internal/transfer/v2_receive.go` (receiver).
 
+The endpoints below are the **plaintext** form, served only with `--plaintext`.
+By default the same chunking, manifest, root and resume state are carried by
+the end-to-end encrypted endpoints under `/e2e/{offer}/` (`hello`, `confirm`,
+`manifest`, `chunks?first=&last=`, `ack`), described in
+[e2e-encryption.md](e2e-encryption.md). There, chunks are requested by index,
+and each comes back as one sealed message, instead of by byte range. Both modes
+share the receiver's resume files.
+
 ## Offer
 
 `GET /v2/offer` returns, after the v1 gates (browser guard, then exact-node
@@ -139,15 +147,19 @@ names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
   already requires to be trusted. Two concurrent receives of the same name
   from the same sender into one directory are unsupported. Final verification
   prevents a corrupt publish, but the attempts may interfere.
-* **Downgrade:** the receiver falls back to v1 only when `/v2/offer` returns
-  404, and v1 is equally authenticated, so a downgrade loses resume but not
-  authenticity.
+* **Downgrade:** in plaintext mode the receiver falls back to v1 only when
+  `/v2/offer` returns 404, and v1 is equally authenticated, so a downgrade
+  loses resume but not authenticity. Encrypted and plaintext modes never fall
+  back to each other: a sender answers unknown paths with `X-Tailbeam-Mode`,
+  and a receiver in the other mode stops with an error.
 
 ## Compatibility
 
-* A new receiver tries `/v2/offer` first and falls back to `/v1/offer` on 404,
-  so it works with old senders.
-* A new sender serves v2 only. For an old receiver, run `tailbeam send --v1`.
+* Default (encrypted) senders and receivers interoperate only with each other.
+* With `--plaintext`, a new receiver tries `/v2/offer` first and falls back to
+  `/v1/offer` on 404, so it works with old senders.
+* `send --plaintext` serves v2 only. For a receiver older than v2, run
+  `tailbeam send --plaintext --v1`.
 
 ## Deferred
 
