@@ -687,7 +687,7 @@ func TestV2GatesOnEveryEndpoint(t *testing.T) {
 				// Proxy headers must never stand in for the TCP peer.
 				r.Header.Set("X-Forwarded-For", "100.64.0.2")
 			case "wrong guard":
-				r.Header.Set(browserGuardHeader, "setec")
+				r.Header.Set(browserGuardHeader, "other-app")
 			case "origin":
 				r.Header.Set("Origin", "https://evil.example")
 			case "fetch metadata":

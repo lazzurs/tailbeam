@@ -22,7 +22,7 @@ import (
 const DefaultPort = 8784
 const maxMetadata = 16 << 10
 
-// Like Setec, require a forbidden-to-browser-JavaScript Sec-* header. This is
+// Require a forbidden-to-browser-JavaScript Sec-* header. This is
 // defense against browser-based access from an otherwise authorized host,
 // including same-origin requests after DNS rebinding. It is not authentication.
 const browserGuardHeader = "Sec-X-Tailscale-No-Browsers"

@@ -70,8 +70,7 @@ when no direct path exists; they cannot decrypt it.
   corruption. In encrypted mode, only a holder of the code can produce the file.
   That proves possession of the code, not a person's identity.
 
-See [SECURITY.md](../SECURITY.md) for the full model, and
-[setec-review.md](setec-review.md) for a comparison with Tailscale's Setec.
+See [SECURITY.md](../SECURITY.md) for the full model.
 
 ## Why not Tailcat or Taildrop?
 

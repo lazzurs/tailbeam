@@ -52,8 +52,8 @@ type Backend interface {
 	WhoIs(context.Context, string) (*Identity, error)
 }
 
-// Local uses the same typed LocalAPI identity client as Setec, but connects to
-// the existing host daemon instead of enrolling an application-owned tsnet node.
+// Local uses the typed LocalAPI client against the existing host daemon,
+// rather than enrolling an application-owned tsnet node.
 type Local struct{ client *local.Client }
 
 func NewLocal(socket string) *Local {

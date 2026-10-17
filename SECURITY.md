@@ -19,7 +19,7 @@ node. Receiving with an explicit sender pins it before polling; discovery pins
 each candidate before connecting. A fresh identity check runs for every incoming
 request and every outgoing TCP connection. Lookup failures deny access.
 
-As in Setec, every API request requires the forbidden-to-browser-JavaScript
+Every API request requires the forbidden-to-browser-JavaScript
 `Sec-X-Tailscale-No-Browsers` header, with the value `tailbeam`. Requests carrying
 `Origin` or `Sec-Fetch-Site` are rejected too. This blocks browser-based access
 from an otherwise authorized machine, including DNS rebinding. This public header

@@ -36,8 +36,7 @@ TCP 8784 from the receiver to the sender.
   security boundary.
 - [Protocol v2](docs/protocol-v2.md) and [end-to-end encryption](docs/e2e-encryption.md):
   the wire formats.
-- [Security model](SECURITY.md), [Setec comparison](docs/setec-review.md) and
-  [app-capability grants](docs/app-capabilities.md).
+- [Security model](SECURITY.md) and [app-capability grants](docs/app-capabilities.md).
 - [Development and releases](docs/development.md).
 
 Tailbeam is new and has not been independently audited.
