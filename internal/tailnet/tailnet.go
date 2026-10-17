@@ -14,6 +14,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 )
 
 type Node struct {
@@ -23,6 +24,8 @@ type Node struct {
 	TailscaleIPs []string
 	Online       bool
 	Tags         []string
+	// CapMap holds node attributes (policy nodeAttrs) from the daemon's netmap.
+	CapMap tailcfg.NodeCapMap
 }
 
 type Status struct {
@@ -39,6 +42,9 @@ type WhoIsNode struct {
 type Identity struct {
 	Node        *WhoIsNode
 	UserProfile *struct{ LoginName string }
+	// CapMap holds the app capabilities the identified peer has toward this
+	// node, computed by the local daemon from the tailnet policy.
+	CapMap tailcfg.PeerCapMap
 }
 
 type Backend interface {
@@ -65,6 +71,7 @@ func node(p *ipnstate.PeerStatus) *Node {
 	if p.Tags != nil {
 		n.Tags = p.Tags.AsSlice()
 	}
+	n.CapMap = p.CapMap
 	return n
 }
 
@@ -95,7 +102,7 @@ func (c *Local) WhoIs(ctx context.Context, addr string) (*Identity, error) {
 	if id == nil || id.Node == nil || id.Node.StableID == "" {
 		return nil, errors.New("Tailscale did not identify the connection")
 	}
-	return &Identity{Node: &WhoIsNode{StableID: string(id.Node.StableID), Addresses: id.Node.Addresses}}, nil
+	return &Identity{Node: &WhoIsNode{StableID: string(id.Node.StableID), Addresses: id.Node.Addresses}, CapMap: id.CapMap}, nil
 }
 
 // Resolve matches only daemon-supplied peer names/addresses, never public DNS.
@@ -146,25 +153,32 @@ func IsTailscaleIP(a netip.Addr) bool {
 // Verify checks both the node ID and address ownership reported by the daemon.
 // Forwarded-for headers and HTTP identity claims are deliberately ignored.
 func Verify(ctx context.Context, b Backend, addr string, expected string) error {
+	_, err := VerifyIdentity(ctx, b, addr, expected)
+	return err
+}
+
+// VerifyIdentity is Verify, returning the verified identity so callers can
+// evaluate the app capabilities it carries.
+func VerifyIdentity(ctx context.Context, b Backend, addr string, expected string) (*Identity, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	a, err := netip.ParseAddr(host)
 	if err != nil || !IsTailscaleIP(a) {
-		return errors.New("connection is not from a Tailscale address")
+		return nil, errors.New("connection is not from a Tailscale address")
 	}
 	id, err := b.WhoIs(ctx, addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if id == nil || id.Node == nil || id.Node.StableID == "" || id.Node.StableID != expected {
-		return errors.New("unexpected Tailscale node identity")
+		return nil, errors.New("unexpected Tailscale node identity")
 	}
 	for _, ip := range id.Node.Addresses {
 		if ip.Addr() == a && ip.IsSingleIP() {
-			return nil
+			return id, nil
 		}
 	}
-	return errors.New("Tailscale identity does not own the connection address")
+	return nil, errors.New("Tailscale identity does not own the connection address")
 }
