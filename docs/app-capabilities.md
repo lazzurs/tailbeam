@@ -181,20 +181,34 @@ sender) are still needed for connectivity.
 - Warn mode: `warning: policy would deny: …` and the transfer proceeds
 - Invalid policy: `warning: ignoring invalid policy entry: linuskendall.com/cap/tailbeam value 1: json: unknown field "filenames"`
 
+## Live test (2026-10-17)
+
+Tested on the `royal-banfish.ts.net` tailnet between mini-ws and khb-pve11,
+with temporary grants under `linuskendall.com/cap/tailbeam-test` and
+`linuskendall.com/cap/tailbeam-node-test`. They were added in
+linuskendall/khb-setup#304 and removed in #305. Both nodes already had network
+access in both directions.
+
+| Check | Result |
+| --- | --- |
+| Sender (mini-ws) `WhoIs` of the receiver | receiver's `receive` grant visible |
+| Receiver (khb-pve11) `WhoIs` of the sender | sender's `send` grant visible; receiver-side enforcement works without a reverse connection |
+| mini-ws `Self.CapMap` | custom-domain `nodeAttrs` `app` value visible, so the admin mode can come from policy |
+| khb-pve12 `WhoIs` of mini-ws (control) | no capability |
+| `ParseGrants` / `Check` in enforce mode on the live values | allowed and denied exactly as granted (action, `maxBytes`, `requireE2E`) |
+
 ## Open questions
 
 1. **Is a cap-only grant delivered without network access?** The docs say app
-   capabilities "apply only if the device has network-level access". For the
-   receiver-side check, the grant runs sender to receiver, a direction with no
-   tailbeam traffic. If control drops a `CapGrant` with no matching `ip` rule,
-   admins would have to add a harmless `ip` rule, such as a port nothing
-   listens on. Verify on a live tailnet.
-2. **Do custom-domain `nodeAttrs` `app` values reach `Self.CapMap`?** The only
-   documented user is Tailscale's own `tailscale.com/app-connectors`. Verify
-   live; if not, the mode falls back to the flag only.
-3. **Capability domain:** pick a real one the project controls before release.
-4. **Should `warn` be the default** when a tailnet uses the capability at all,
+   capabilities "apply only if the device has network-level access". The live
+   test could not settle this: both nodes already had broad network access, and
+   removing it was out of scope. Until it is verified, document that the
+   receiver-side grant (sender to receiver) may need a harmless `ip` rule in that
+   direction.
+2. **Capability domain:** `linuskendall.com` (decided). The names are
+   `linuskendall.com/cap/tailbeam` and `linuskendall.com/cap/tailbeam-node`.
+3. **Should `warn` be the default** when a tailnet uses the capability at all,
    that is, when a peer's `CapMap` has the key? Absence is exactly the denial
    case, so that signal can't be relied on in general.
-5. **Shared or multi-user nodes:** capabilities are per node, like the rest of
+4. **Shared or multi-user nodes:** capabilities are per node, like the rest of
    the model. Pairing them with the E2E code addresses the per-user part.
