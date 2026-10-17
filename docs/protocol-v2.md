@@ -200,7 +200,18 @@ partial names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
 
 ## Deferred
 
-* zstd compression per chunk, negotiated through `Accept-Encoding`.
+* zstd compression per chunk, negotiated through `Accept-Encoding`. Measured on
+  a 57 MB sample of a Proxmox host's logs on a Celeron N3160: `zstd -1` ratio
+  15.6×, compression 160 MB/s, decompression 440 MB/s (one core). Against a
+  link and receiver that top out near 25–60 MB/s, that would multiply
+  throughput for logs, dumps and text, and do nothing for media or
+  already-compressed archives. It is not a small change:
+  - **Framing:** plaintext v2 serves raw byte ranges, so it would need
+    per-chunk framing like the encrypted mode, plus a raw/compressed flag per
+    chunk so incompressible chunks are sent as is.
+  - **Lengths:** responses would lose their up-front `Content-Length`.
+  - **Leakage:** in encrypted mode, compressed sizes leak how compressible each
+    chunk is, so it should be opt-in there.
 * Delta transfer against an existing receiver file (`--base`), likely with
   content-defined chunking.
 * Streaming mode for unknown sizes (stdin, on-the-fly archives) and directories.

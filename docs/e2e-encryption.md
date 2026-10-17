@@ -160,7 +160,29 @@ ad_ack     = "tailbeam-e2e-v1 ack" ‖ lp(offer) ‖ lp(root)
 
 **Memory.** The sender seals one whole chunk per in-flight request: up to 8
 concurrent reads at chunk size (8 MiB by default, up to 64 MiB for files over
-8 TiB), plus the sealed copy.
+8 TiB), plus the sealed copy. The receiver holds one sealed and one plaintext
+chunk buffer per stream (`--streams`, default 2).
+
+**Cost.** XChaCha20-Poly1305 on one core, per 8 MiB chunk:
+
+| CPU | Seal | Open |
+| --- | --- | --- |
+| Intel N100 (VM) | 537 MB/s (2.0 s/GiB) | 777 MB/s (1.4 s/GiB) |
+| Celeron N3160 (busy host) | 84 MB/s (12.8 s/GiB) | 99 MB/s (10.8 s/GiB) |
+
+Each receive stream opens its own chunks, so streams spread this over cores.
+Two choices were measured and not adopted:
+
+- **Sealing in smaller segments, or pipelining read and seal with the write,
+  so a stream never idles during crypto.** Overlapping the next chunk's read
+  and seal with the current write made no difference live (49.8 vs 48.9 MB/s,
+  N3160 to N100, 2 streams) or on the N3160's loopback (36 MB/s both), because
+  both ends were CPU-bound, not idle. Parallel streams already overlap the
+  work. The wire format stays one AEAD message per chunk.
+- **AES-256-GCM.** It is faster where AES-NI exists (2.0 GB/s on the N100, 177
+  MB/s on the N3160), but it has a 96-bit nonce and would be a crypto change.
+  Removing the receiver's SHA-256, a larger per-byte cost, made no measurable
+  live difference either: the busy host's `tailscaled` was the limit.
 
 ## CLI
 
