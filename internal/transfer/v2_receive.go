@@ -18,8 +18,10 @@ import (
 
 const (
 	v2ReadIdle        = time.Minute // abort a body read with no progress for this long
-	v2CheckpointBytes = 64 << 20
-	v2CheckpointEvery = 2 * time.Second
+	// Each checkpoint fsyncs the partial file, which is slow on some
+	// filesystems (ZFS); a crash only costs refetching unrecorded chunks.
+	v2CheckpointBytes = 256 << 20
+	v2CheckpointEvery = 10 * time.Second
 	v2Attempts        = 3 // consecutive failed attempts without progress
 	v2MaxState        = 4 << 20
 )

@@ -105,7 +105,7 @@ never followed, and the partial file is created with `O_EXCL`.
 
 For each chunk, the receiver writes the bytes into the partial file at the
 chunk's offset while hashing them, compares the hash with the manifest, and
-only then sets the chunk's bit. Every 64 MiB or 2 seconds, and on any error,
+only then sets the chunk's bit. Every 256 MiB or 10 seconds, and on any error,
 it syncs the partial file **before** writing the state (temp file, sync,
 rename), so a recorded bit never refers to unsynced data. A lost state update
 only causes chunks to be fetched again.
