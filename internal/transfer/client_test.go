@@ -37,7 +37,7 @@ func TestClientAuthenticatesBeforeSendingHTTP(t *testing.T) {
 	for _, kind := range []string{"correct", "wrong node", "wrong address", "daemon unavailable", "redirect"} {
 		t.Run(kind, func(t *testing.T) {
 			var calls atomic.Int32
-			s := sender(t, []byte("secret"), allow)
+			s := senderV2(t, writeSource(t, []byte("secret")), allow)
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				if kind == "redirect" {
@@ -74,7 +74,7 @@ func TestClientAuthenticatesBeforeSendingHTTP(t *testing.T) {
 			defer c.CloseIdleConnections()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, err = FetchOffer(ctx, c, base)
+			_, err = FetchPlainOffer(ctx, c, base)
 			if kind == "correct" {
 				if err != nil {
 					t.Fatal(err)

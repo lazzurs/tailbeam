@@ -44,8 +44,7 @@ Common flags: --port 8784 --timeout 1h --deadline 0 --socket PATH --plaintext
               (default 0 = none)
   --plaintext rely on Tailscale's encryption only, with no transfer code; both
               sides must use it
-Send flags: --v1 (with --plaintext: serve protocol v1, without resume, for
-              older receivers)
+Send flags: --no-cache
   --no-cache  re-hash a large file even if its manifest is cached (in the
               user cache directory, keyed by inode, size, mtime and ctime)
 Receive flags: --dir . --max-bytes 1073741824 --idle-timeout 5m --yes
@@ -89,10 +88,8 @@ func run(ctx context.Context, args []string) error {
 	var idle *time.Duration
 	var yes *bool
 	streams := new(int)
-	v1 := new(bool)
 	noCache := new(bool)
 	if mode == "send" {
-		v1 = fs.Bool("v1", false, "with --plaintext: serve protocol v1 (no resume) for older receivers")
 		noCache = fs.Bool("no-cache", false, "do not read or write the cached manifest of a large file")
 	}
 	if mode == "receive" {
@@ -119,9 +116,6 @@ func run(ctx context.Context, args []string) error {
 	}
 	if max != nil && *max < 0 {
 		return errors.New("max-bytes must be nonnegative")
-	}
-	if *v1 && !*plaintext {
-		return errors.New("--v1 has no end-to-end encryption; it requires --plaintext")
 	}
 	if mode == "receive" && !*yes && !isTerminal(os.Stdin) {
 		return errors.New("stdin is not a terminal; pass --yes to receive without confirmation")
@@ -162,12 +156,12 @@ func run(ctx context.Context, args []string) error {
 		if *noCache {
 			cacheDir = ""
 		}
-		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout, *plaintext, *v1, cacheDir)
+		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout, *plaintext, cacheDir)
 	}
 	return receive(ctx, b, s, host, code, *port, *dir, *max, *timeout, *idle, *yes, *streams)
 }
 
-func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration, plaintext, v1 bool, cacheDir string) error {
+func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration, plaintext bool, cacheDir string) error {
 	peer, err := tailnet.Resolve(status, host)
 	if err != nil {
 		return err
@@ -180,30 +174,7 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 	if !plaintext {
 		return sendE2E(ctx, status, peer, ip, path, port, timeout, authorize, cacheDir)
 	}
-	if !v1 {
-		return sendV2(ctx, status, peer, ip, path, port, timeout, authorize, cacheDir)
-	}
-	s, err := transfer.NewSender(ctx, path, authorize)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	l, err := net.Listen("tcp", net.JoinHostPort(ip, fmt.Sprint(port)))
-	if err != nil {
-		return fmt.Errorf("listen on Tailscale address (requires the OS TUN interface): %w", err)
-	}
-	defer l.Close()
-	// --timeout bounds only the wait for a receiver; once the first file request
-	// begins, the sender's per-write deadline handles stalls.
-	ctx, stop := waitForReceiver(ctx, timeout, s.Started())
-	defer stop()
-	fmt.Fprintf(os.Stderr, "Offering %q (%d bytes, plaintext v1) to %q [%s] only.\n", s.Offer.Name, s.Offer.Size, peer.DNSName, peer.ID)
-	fmt.Fprintf(os.Stderr, "On that host run: tailbeam receive --plaintext %s%s\n", portFlag(port), status.Self.ID)
-	if err := transfer.Serve(ctx, l, s); err != nil {
-		return serveErr(ctx, err, timeout)
-	}
-	fmt.Fprintln(os.Stderr, "Receiver acknowledged the saved file.")
-	return nil
+	return sendV2(ctx, status, peer, ip, path, port, timeout, authorize, cacheDir)
 }
 
 func portFlag(port int) string {
@@ -303,7 +274,7 @@ func (c candidate) close() { c.client.CloseIdleConnections() }
 type probe func(ctx context.Context, c *http.Client, base string, p *tailnet.Node) (candidate, error)
 
 func plaintextProbe(ctx context.Context, c *http.Client, base string, p *tailnet.Node) (candidate, error) {
-	r, err := transfer.FetchAnyOffer(ctx, c, base)
+	r, err := transfer.FetchPlainOffer(ctx, c, base)
 	if err != nil {
 		return candidate{}, err
 	}

@@ -106,7 +106,7 @@ func TestLoopbackThroughput(t *testing.T) {
 	report("sender manifest (hash)", time.Since(start))
 	ts := httptest.NewServer(v2)
 	start = time.Now()
-	r, err := FetchAnyOffer(ctx, ts.Client(), ts.URL)
+	r, err := FetchPlainOffer(ctx, ts.Client(), ts.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
