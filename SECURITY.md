@@ -19,7 +19,7 @@ node. Receiving with an explicit sender pins it before polling; discovery pins
 each candidate before connecting. A fresh identity check runs for every incoming
 request and every outgoing TCP connection. Lookup failures deny access.
 
-As in Setec, every API request requires the forbidden-to-browser-JavaScript
+Every API request requires the forbidden-to-browser-JavaScript
 `Sec-X-Tailscale-No-Browsers` header, with the value `tailbeam`. Requests carrying
 `Origin` or `Sec-Fetch-Site` are rejected too. This blocks browser-based access
 from an otherwise authorized machine, including DNS rebinding. This public header
@@ -79,25 +79,27 @@ vector. The data-sealing layer is ours. Neither has been externally reviewed.
 ## Protocol v2
 
 Protocol v2 (used by both modes; plaintext with `--plaintext`) adds a chunk
-manifest, range reads and on-disk resume state. It keeps every v1 gate on every endpoint. Its integrity, resume-file and
+manifest, range reads and on-disk resume state. Every endpoint passes the
+browser guard and the exact-node check first. Its integrity, resume-file and
 hostile-offer analysis is in [docs/protocol-v2.md](docs/protocol-v2.md).
 Resume files are private, regular-file-only, and discarded unless they match the
-offer's sender, name, size, chunk size and root exactly. The complete partial
-file is re-verified before publication.
+offer's sender, name, size, chunk size and root exactly. Every chunk is checked
+against the manifest exactly once before publication, as it arrives or when a
+resume reads it back. The earlier whole-file protocol v1 has been removed.
 
-## Protocol v1
+## Endpoints
 
-* `GET /v1/offer` returns version, random 256-bit offer ID, base filename, size,
-  and SHA-256 hash, only after destination-node verification.
-* `GET /v1/file/ID` streams that single file. The ID also binds a receiver to the
-  offer it selected; it does not replace node authentication.
-* `POST /v1/ack/ID` consumes the offer. The intended receiver is trusted to
+* The offer ID (random in plaintext mode, derived from the code in encrypted
+  mode) binds a receiver to the offer it selected; it does not replace node
+  authentication.
+* The acknowledgement consumes the offer. The intended receiver is trusted to
   acknowledge honestly. Consumption does not prove future durability or erasure.
 
 There are no listings of directories, arbitrary paths, upload endpoints, or shell
-execution. One handler operates on an offer at a time. Completed offers are
-inaccessible, and all offers expire when the sender process or timeout ends.
-Unauthorized requests receive a generic 403 without transfer metadata.
+execution. Up to 8 reads of an offer run at once; only the acknowledgement takes
+the offer's lock. Completed offers are inaccessible (410), and all offers expire
+when the sender process exits. Unauthorized requests receive a generic 403
+without transfer metadata.
 
 ## File safety and resource bounds
 
@@ -145,7 +147,7 @@ makes the receiver reject chunks. Use `send --no-cache` to avoid it.
 ## Testing scope
 
 Automated tests use real loopback HTTP with mocked Tailscale identities and cover
-the rejection cases described in the README, including the encrypted mode's
+the rejection cases listed in [docs/development.md](docs/development.md), including the encrypted mode's
 wrong-code, binding, tamper, burn and mode-mismatch cases. They do not prove the correctness
 of WireGuard, daemon behavior, tailnet policy, or OS routing. Live cross-host
 validation remains necessary in the intended deployment. No live tailnet

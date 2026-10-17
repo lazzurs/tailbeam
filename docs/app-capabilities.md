@@ -43,8 +43,6 @@ Source paths below are under the module cache, `tailscale.com@v1.104.1/`.
   addresses from the local filter (`ipn/ipnlocal/node_backend.go:407-466`). The
   type is `tailcfg.PeerCapMap` = `map[peercap.Cap][]RawMessage`, decoded with
   `tailcfg.UnmarshalCapJSON` (`tailcfg/tailcfg.go:1672-1712`).
-- **Precedent.** Setec reads `tailscale.com/cap/secrets` from `WhoIs` `CapMap`
-  the same way ([`server.go#L330`](https://github.com/tailscale/setec/blob/bc168fdb236279b5c5a43d14685df674d7fefb35/server/server.go#L330)).
 - **Node attributes.** `nodeAttrs` entries take `target`, `attr` and `app`.
   `app` values land in the target node's *own* `CapMap`, which LocalAPI
   `Status` exposes as `Self.CapMap` (`ipn/ipnlocal/local.go:1565-1570`;

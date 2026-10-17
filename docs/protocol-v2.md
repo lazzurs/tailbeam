@@ -4,7 +4,9 @@ Protocol v2 makes very large transfers practical. The sender splits the file
 into fixed-size chunks and hashes each one; the receiver verifies every chunk
 as it arrives, records verified chunks on disk, and resumes from them after
 any failure, including a restart of either process. Identity, authorization,
-and browser defenses are unchanged from v1 and apply to every v2 endpoint.
+and browser defenses are the same as in the encrypted mode and apply to every
+endpoint. v2 is the only plaintext protocol; the whole-file protocol v1 was
+removed.
 
 Implementation: `internal/transfer/v2.go` (sender) and
 `internal/transfer/v2_receive.go` (receiver).
@@ -19,7 +21,7 @@ share the receiver's resume files.
 
 ## Offer
 
-`GET /v2/offer` returns, after the v1 gates (browser guard, then exact-node
+`GET /v2/offer` returns, after the gates (browser guard, then exact-node
 `WhoIs` check):
 
 ```json
@@ -31,7 +33,7 @@ share the receiver's resume files.
 | --- | --- | --- |
 | `version` | `2` | exactly 2 |
 | `id` | random 256-bit offer token, new per sender process | 32 bytes of hex |
-| `name` | base file name | v1 `validName` |
+| `name` | base file name | `validName` |
 | `size` | bytes | `0 <= size <= --max-bytes` |
 | `chunk_size` | bytes per chunk; the last chunk may be shorter | power of two, 64 KiB to 64 MiB |
 | `hash` | chunk hash algorithm | exactly `sha256` |
@@ -73,7 +75,7 @@ skips the cache. Linux and macOS only; elsewhere the file is always hashed.
 
 ### Why SHA-256 and not BLAKE3
 
-Chunk-level parallelism already removes v1's single-core hashing bottleneck:
+Chunk-level parallelism removes the single-core bottleneck of a whole-file hash:
 SHA-256 with SHA-NI runs at about 0.9 GB/s per core on a low-power Intel N100,
 so 4 to 8 workers keep pace with fast disks and the network. Staying with the
 standard library avoids a new dependency in a security tool and keeps Go's
@@ -100,7 +102,7 @@ segment as one range, and requires the exact `Content-Range` and
 `Content-Length` it asked for. `--streams` (default 2, at most 8) segments are
 in flight at once, each on its own connection.
 
-Unlike v1, reads are not serialized behind the offer lock: up to 8 manifest or
+Reads are not serialized behind the offer lock: up to 8 manifest or
 file requests may run at once (more get 429), and only `ack` takes the lock.
 Each write extends a one-minute write deadline, so a stalled peer releases its
 slot instead of blocking retries until TCP gives up.
@@ -159,13 +161,13 @@ against the manifest exactly once: either as it was written in this run, or
 as it was read back when resuming. There is no separate pass over the whole
 file. Such a pass would mostly have read the page cache, not the disk, so it
 did not meaningfully protect against disk faults, and it cost a full extra
-SHA-256 pass (about 6 seconds per GiB on four N3160 cores). Then, as in v1:
+SHA-256 pass (about 6 seconds per GiB on four N3160 cores). Then:
 `fsync`, then `link(part, dest)` (atomic, never replaces), remove the state and
 partial names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
 
 ## Security analysis
 
-* **Unchanged:** every v2 request passes the v1 browser guard and exact-node
+* **Gates:** every v2 request passes the browser guard and exact-node
   `WhoIs` check before any metadata, manifest or byte is returned. The client
   dials only the pinned address and verifies the sender on every TCP connection.
 * **What chunk hashes protect:** source changes during or between transfers,
@@ -173,7 +175,7 @@ partial names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
   stale partial file. WireGuard already authenticates packets in transit.
 * **What they do not protect:** the manifest and root come from the sender over
   the same channel, so they prove consistency with the sender's claim, not the
-  sender's honesty. This is the same as v1's whole-file hash.
+  sender's honesty.
 * **Hostile offers:** chunk size and count are bounded, so an authenticated
   but hostile sender can make the receiver hold at most a 128 MiB manifest
   (plus one byte per chunk of bookkeeping), and write at most `--max-bytes`.
@@ -184,19 +186,17 @@ partial names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
   from the same sender into one directory are unsupported; they may interfere
   and fail, and a chunk overwritten by the other attempt after it was verified
   could be published. Another user cannot cause this: the files are private.
-* **Downgrade:** in plaintext mode the receiver falls back to v1 only when
-  `/v2/offer` returns 404, and v1 is equally authenticated, so a downgrade
-  loses resume but not authenticity. Encrypted and plaintext modes never fall
-  back to each other: a sender answers unknown paths with `X-Tailbeam-Mode`,
-  and a receiver in the other mode stops with an error.
+* **No downgrade:** there is no older protocol to fall back to. Encrypted and
+  plaintext modes never fall back to each other: a sender answers unknown paths
+  with `X-Tailbeam-Mode`, and a receiver in the other mode stops with an error.
 
 ## Compatibility
 
-* Default (encrypted) senders and receivers interoperate only with each other.
-* With `--plaintext`, a new receiver tries `/v2/offer` first and falls back to
-  `/v1/offer` on 404, so it works with old senders.
-* `send --plaintext` serves v2 only. For a receiver older than v2, run
-  `tailbeam send --plaintext --v1`.
+* Default (encrypted) senders and receivers interoperate only with each other,
+  and `--plaintext` senders and receivers only with each other.
+* Protocol v1, a whole-file transfer without resume, was removed after
+  v0.1.0. The `--v1` flag is gone, and a plaintext receiver no longer falls
+  back to `/v1/offer`.
 
 ## Deferred
 

@@ -18,7 +18,7 @@ replacement.
 
 | Question | Decision |
 | --- | --- |
-| Default mode | Encrypted. `--plaintext` (both sides) restores protocol v2, with v1 fallback and `send --plaintext --v1`. There is never a silent fallback in either direction. |
+| Default mode | Encrypted. `--plaintext` (both sides) uses plaintext protocol v2. There is never a silent fallback in either direction. |
 | Where the offer ID comes from | Derived from the code: `HKDF(code, "tailbeam-e2e-v1 offer-id")`. No plaintext offer endpoint exists, and the code stays 28 characters. |
 | Code lifetime | One code per transfer. No per-person keys, keygen or contacts. |
 | Handshake | `flynn/noise` `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, not a hand-assembled construction. |
@@ -212,7 +212,7 @@ network use, so a typo never spends one of the 3 attempts. In `HOST:CODE`:
 - An unbracketed IPv6 address is never split.
 - A numeric suffix (`laptop:8784`) is rejected with "ports use --port".
 
-`--v1` requires `--plaintext`. A code given with `--plaintext` is an error.
+A code given with `--plaintext` is an error.
 
 ## Code
 

@@ -60,7 +60,7 @@ func TestRunValidatesModeAndCodeBeforeNetwork(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"send", "--v1", "f", "h"}, "--plaintext"},
+		{[]string{"send", "--v1", "f", "h"}, "flag provided but not defined"},
 		{[]string{"receive", "--yes", "laptop:8784"}, "--port"},
 		{[]string{"receive", "--yes", "laptop:aaaa-aaaa-aaaa-aaaa-aaaa-aaaa-aaaa"}, "checksum"},
 		// No code anywhere and no terminal to prompt on.

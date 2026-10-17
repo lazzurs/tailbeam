@@ -223,7 +223,7 @@ func TestE2ENodeIdentityWithoutCodeGetsNothing(t *testing.T) {
 	}
 	unconfirmed := strings.Split(strings.Split(string(payload), `"sid":"`)[1], `"`)[0]
 	for _, mp := range [][2]string{
-		{"GET", "/v2/offer"}, {"GET", "/v1/offer"}, {"GET", "/v2/manifest/" + id}, {"GET", "/v2/file/" + id},
+		{"GET", "/v2/offer"}, {"GET", "/v2/manifest/" + id}, {"GET", "/v2/file/" + id},
 		{"GET", "/e2e/" + id + "/manifest"}, {"GET", "/e2e/" + id + "/manifest?sid=" + strings.Repeat("0", 32)},
 		{"GET", "/e2e/" + id + "/manifest?sid=" + unconfirmed}, {"GET", "/e2e/" + id + "/chunks?first=0&last=0&sid=" + unconfirmed},
 		{"POST", "/e2e/" + id + "/ack?sid=" + unconfirmed}, {"POST", "/e2e/" + id + "/confirm"},
@@ -412,23 +412,18 @@ func TestModeMismatch(t *testing.T) {
 	data := []byte("data")
 	code := newCode(t)
 
-	// Encrypted receiver, plaintext senders (v2 and v1).
-	for name, h := range map[string]http.Handler{"v2": senderV2(t, writeSource(t, data), allow), "v1": sender(t, data, allow)} {
-		ts := httptest.NewServer(h)
-		_, err := FetchE2EOffer(context.Background(), ts.Client(), ts.URL, code, testSender, testReceiver)
-		ts.Close()
-		if !errors.Is(err, ErrSenderPlaintext) {
-			t.Errorf("%s: %v", name, err)
-		}
+	// Encrypted receiver, plaintext sender.
+	ts := httptest.NewServer(senderV2(t, writeSource(t, data), allow))
+	_, err := FetchE2EOffer(context.Background(), ts.Client(), ts.URL, code, testSender, testReceiver)
+	ts.Close()
+	if !errors.Is(err, ErrSenderPlaintext) {
+		t.Errorf("encrypted receiver: %v", err)
 	}
 
 	// Plaintext receiver, encrypted sender: an error, never a plaintext offer.
-	ts := httptest.NewServer(senderE2E(t, writeSource(t, data), code, allow))
+	ts = httptest.NewServer(senderE2E(t, writeSource(t, data), code, allow))
 	defer ts.Close()
-	if _, err := FetchAnyOffer(context.Background(), ts.Client(), ts.URL); !errors.Is(err, ErrSenderEncrypted) {
+	if _, err := FetchPlainOffer(context.Background(), ts.Client(), ts.URL); !errors.Is(err, ErrSenderEncrypted) {
 		t.Fatalf("plaintext receiver: %v", err)
-	}
-	if _, err := FetchOffer(context.Background(), ts.Client(), ts.URL); !errors.Is(err, ErrSenderEncrypted) {
-		t.Fatalf("v1 receiver: %v", err)
 	}
 }

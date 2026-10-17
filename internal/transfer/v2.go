@@ -181,6 +181,7 @@ type SenderV2 struct {
 	done      chan struct{}
 	started   chan struct{}
 	startOnce sync.Once
+	writeIdle time.Duration // v2WriteIdle; tests shorten it
 }
 
 // NewSenderV2 prepares a plaintext v2 offer. cacheDir holds cached manifests
@@ -250,7 +251,7 @@ func newSenderV2(ctx context.Context, path string, authorize Authorize, chunk in
 	}
 	o := OfferV2{2, hex.EncodeToString(token[:]), name, size, chunk, v2Hash, hex.EncodeToString(v2Root(size, chunk, manifest))}
 	ok = true
-	return &SenderV2{Offer: o, file: f, manifest: manifest, authorize: authorize, reads: make(chan struct{}, v2MaxReads), done: make(chan struct{}), started: make(chan struct{})}, nil
+	return &SenderV2{Offer: o, file: f, manifest: manifest, authorize: authorize, reads: make(chan struct{}, v2MaxReads), done: make(chan struct{}), started: make(chan struct{}), writeIdle: v2WriteIdle}, nil
 }
 
 func (s *SenderV2) Close() error          { return s.file.Close() }
@@ -260,7 +261,7 @@ func (s *SenderV2) Done() <-chan struct{} { return s.done }
 func (s *SenderV2) Started() <-chan struct{} { return s.started }
 
 func (s *SenderV2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The same gates as v1, in the same order: browser guard, then identity.
+	// Browser guard first, then identity, so a browser never costs a lookup.
 	if r.Header.Get(browserGuardHeader) != browserGuardValue || r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") != "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -290,7 +291,7 @@ func (s *SenderV2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.startOnce.Do(func() { close(s.started) })
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", fmt.Sprint(len(s.manifest)))
-		v2Copy(w, bytes.NewReader(s.manifest))
+		v2Copy(w, bytes.NewReader(s.manifest), s.writeIdle)
 	case r.Method == "GET" && r.URL.Path == "/v2/file/"+s.Offer.ID:
 		if !s.acquire(w) {
 			return
@@ -338,7 +339,7 @@ func (s *SenderV2) serveFile(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, size))
 		w.WriteHeader(http.StatusPartialContent)
 	}
-	v2Copy(w, io.NewSectionReader(s.file, start, end-start))
+	v2Copy(w, io.NewSectionReader(s.file, start, end-start), s.writeIdle)
 }
 
 // v2ParseRange accepts no header (the whole file) or exactly one
@@ -381,14 +382,14 @@ func v2Digits(s string) bool {
 }
 
 // v2Copy streams r to w, extending the connection's write deadline after
-// every write so a stalled peer releases its read slot after v2WriteIdle.
-func v2Copy(w http.ResponseWriter, r io.Reader) {
+// every write so a stalled peer releases its read slot after idle.
+func v2Copy(w http.ResponseWriter, r io.Reader, idle time.Duration) {
 	rc := http.NewResponseController(w)
 	buf := make([]byte, 256<<10)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			rc.SetWriteDeadline(time.Now().Add(v2WriteIdle))
+			rc.SetWriteDeadline(time.Now().Add(idle))
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return
 			}
