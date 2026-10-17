@@ -32,7 +32,7 @@ func newCode(t *testing.T) e2e.Code {
 
 func senderE2E(t *testing.T, path string, code e2e.Code, auth Authorize) *SenderE2E {
 	t.Helper()
-	s, err := newSenderE2E(context.Background(), path, auth, code, testSender, testReceiver, testChunk)
+	s, err := newSenderE2E(context.Background(), path, auth, code, testSender, testReceiver, testChunk, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,6 +2,8 @@ package transfer
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"net/http/httptest"
 	"os"
@@ -44,6 +46,19 @@ func BenchmarkE2ESealChunk(b *testing.B) {
 	}
 }
 
+// BenchmarkAES256GCMChunk is a reference point for the AEAD choice: it is not
+// used by the protocol.
+func BenchmarkAES256GCMChunk(b *testing.B) {
+	block, _ := aes.NewCipher(make([]byte, 32))
+	a, _ := cipher.NewGCM(block)
+	buf, nonce := make([]byte, v2DefaultChunk), make([]byte, a.NonceSize())
+	out := make([]byte, 0, len(buf)+a.Overhead())
+	b.SetBytes(int64(len(buf)))
+	for b.Loop() {
+		a.Seal(out[:0], nonce, buf, nil)
+	}
+}
+
 func BenchmarkE2EOpenChunk(b *testing.B) {
 	k, buf, id := benchKeys(b), make([]byte, v2DefaultChunk), make([]byte, 32)
 	sealed, err := k.SealChunk(id, id, 1, false, buf)
@@ -83,7 +98,7 @@ func TestLoopbackThroughput(t *testing.T) {
 	ctx := context.Background()
 
 	start := time.Now()
-	v2, err := newSenderV2(ctx, path, allow, 0)
+	v2, err := newSenderV2(ctx, path, allow, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +123,7 @@ func TestLoopbackThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := newSenderE2E(ctx, path, allow, code, testSender, testReceiver, 0)
+	s, err := newSenderE2E(ctx, path, allow, code, testSender, testReceiver, 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}

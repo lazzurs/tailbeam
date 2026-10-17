@@ -42,6 +42,8 @@ Common flags: --port 8784 --timeout 1h --deadline 0 --socket PATH --plaintext
               sides must use it
 Send flags: --v1 (with --plaintext: serve protocol v1, without resume, for
               older receivers)
+  --no-cache  re-hash a large file even if its manifest is cached (in the
+              user cache directory, keyed by inode, size, mtime and ctime)
 Receive flags: --dir . --max-bytes 1073741824 --idle-timeout 5m --yes
   --idle-timeout  abort a download when no bytes arrive for this long; an
                   interrupted download resumes when receive is rerun
@@ -80,8 +82,10 @@ func run(ctx context.Context, args []string) error {
 	var yes *bool
 	streams := new(int)
 	v1 := new(bool)
+	noCache := new(bool)
 	if mode == "send" {
 		v1 = fs.Bool("v1", false, "with --plaintext: serve protocol v1 (no resume) for older receivers")
+		noCache = fs.Bool("no-cache", false, "do not read or write the cached manifest of a large file")
 	}
 	if mode == "receive" {
 		idle = fs.Duration("idle-timeout", 5*time.Minute, "abort a download when no bytes arrive for this long")
@@ -146,12 +150,16 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 	if mode == "send" {
-		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout, *plaintext, *v1)
+		cacheDir := transfer.DefaultManifestCacheDir()
+		if *noCache {
+			cacheDir = ""
+		}
+		return send(ctx, b, s, fs.Arg(0), fs.Arg(1), *port, *timeout, *plaintext, *v1, cacheDir)
 	}
 	return receive(ctx, b, s, host, code, *port, *dir, *max, *timeout, *idle, *yes, *streams)
 }
 
-func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration, plaintext, v1 bool) error {
+func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, host string, port int, timeout time.Duration, plaintext, v1 bool, cacheDir string) error {
 	peer, err := tailnet.Resolve(status, host)
 	if err != nil {
 		return err
@@ -162,10 +170,10 @@ func send(ctx context.Context, b tailnet.Backend, status *tailnet.Status, path, 
 	}
 	authorize := func(ctx context.Context, addr string) error { return tailnet.Verify(ctx, b, addr, peer.ID) }
 	if !plaintext {
-		return sendE2E(ctx, status, peer, ip, path, port, timeout, authorize)
+		return sendE2E(ctx, status, peer, ip, path, port, timeout, authorize, cacheDir)
 	}
 	if !v1 {
-		return sendV2(ctx, status, peer, ip, path, port, timeout, authorize)
+		return sendV2(ctx, status, peer, ip, path, port, timeout, authorize, cacheDir)
 	}
 	s, err := transfer.NewSender(ctx, path, authorize)
 	if err != nil {
@@ -221,8 +229,8 @@ func serveErr(ctx context.Context, err error, timeout time.Duration) error {
 	return err
 }
 
-func sendV2(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip, path string, port int, timeout time.Duration, authorize transfer.Authorize) error {
-	s, err := transfer.NewSenderV2(ctx, path, authorize)
+func sendV2(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip, path string, port int, timeout time.Duration, authorize transfer.Authorize, cacheDir string) error {
+	s, err := transfer.NewSenderV2(ctx, path, authorize, cacheDir)
 	if err != nil {
 		return err
 	}
@@ -243,12 +251,12 @@ func sendV2(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip,
 	return nil
 }
 
-func sendE2E(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip, path string, port int, timeout time.Duration, authorize transfer.Authorize) error {
+func sendE2E(ctx context.Context, status *tailnet.Status, peer *tailnet.Node, ip, path string, port int, timeout time.Duration, authorize transfer.Authorize, cacheDir string) error {
 	code, err := e2e.NewCode()
 	if err != nil {
 		return err
 	}
-	s, err := transfer.NewSenderE2E(ctx, path, authorize, code, status.Self.ID, peer.ID)
+	s, err := transfer.NewSenderE2E(ctx, path, authorize, code, status.Self.ID, peer.ID, cacheDir)
 	if err != nil {
 		return err
 	}

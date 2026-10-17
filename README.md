@@ -69,6 +69,12 @@ the source changes, the partial state is discarded. A resume keeps every chunk
 of the partial file that still matches its hash, including chunks written just
 before the receiver was killed.
 
+The sender hashes the file before offering it. For files of 256 MiB or more it
+caches the result in the user cache directory, keyed by inode, size, mtime and
+ctime, so restarting a send of the same unchanged file (for example to let a
+receiver resume) starts at once instead of re-reading it. `send --no-cache`
+disables this.
+
 The receiver fetches over `--streams` parallel connections (default 2, up to
 8). Each stream also verifies (and decrypts) its own chunks, which spreads that
 work over several cores. Two streams were fastest in live tests between a

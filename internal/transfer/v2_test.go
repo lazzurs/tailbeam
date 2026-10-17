@@ -45,7 +45,7 @@ func writeSource(t *testing.T, data []byte) string {
 
 func senderV2(t *testing.T, path string, auth Authorize) *SenderV2 {
 	t.Helper()
-	s, err := newSenderV2(context.Background(), path, auth, testChunk)
+	s, err := newSenderV2(context.Background(), path, auth, testChunk, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestV2ParallelManifestMatchesSequential(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := newSenderV2(ctx, writeSource(t, data), allow, testChunk); err == nil {
+	if _, err := newSenderV2(ctx, writeSource(t, data), allow, testChunk, ""); err == nil {
 		t.Fatal("hashing ignored cancellation")
 	}
 }

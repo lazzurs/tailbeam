@@ -136,6 +136,12 @@ There is no automatic deletion of source files. Disk exhaustion and unsupported
 hard links produce errors. A verified final file is retained if acknowledgement
 fails; retrying into the same filename is deliberately rejected.
 
+For files of 256 MiB or more, the sender keeps the chunk-hash manifest in a
+private per-user cache (`$XDG_CACHE_HOME/tailbeam/manifests`, 0700/0600). This
+reveals to anyone who can read that directory the chunk hashes of files you
+have sent. It cannot cause a wrong file to be accepted: a stale entry only
+makes the receiver reject chunks. Use `send --no-cache` to avoid it.
+
 ## Testing scope
 
 Automated tests use real loopback HTTP with mocked Tailscale identities and cover
