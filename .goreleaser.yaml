@@ -17,9 +17,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      # No version variable exists in the code yet; add
-      # -X main.version={{.Version}} once one is introduced.
-      - -s -w
+      - -s -w -X main.version={{.Version}}
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
 
@@ -82,10 +80,10 @@ changelog:
 # hook calling osslsigncode/signtool with a code-signing certificate.
 
 # Publishing stage. Only reached by a real `goreleaser release` (the CI
-# workflow on v* tags); `--snapshot` never publishes.
+# workflow on v* tags), which publishes the release; `--snapshot` never does.
 release:
   github:
     owner: linuskendall
     name: tailbeam
-  draft: true
+  draft: false
   prerelease: auto

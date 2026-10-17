@@ -145,7 +145,7 @@ makes the receiver reject chunks. Use `send --no-cache` to avoid it.
 ## Testing scope
 
 Automated tests use real loopback HTTP with mocked Tailscale identities and cover
-the rejection cases described in the README, including the encrypted mode's
+the rejection cases listed in [docs/development.md](docs/development.md), including the encrypted mode's
 wrong-code, binding, tamper, burn and mode-mismatch cases. They do not prove the correctness
 of WireGuard, daemon behavior, tailnet policy, or OS routing. Live cross-host
 validation remains necessary in the intended deployment. No live tailnet

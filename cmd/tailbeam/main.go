@@ -19,10 +19,14 @@ import (
 	"github.com/linuskendall/tailbeam/internal/transfer"
 )
 
+// version is set at release build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 const usage = `tailbeam: single-file transfers authenticated by Tailscale
 
   tailbeam send [flags] FILE DESTINATION
   tailbeam receive [flags] [SENDER[:CODE] | CODE]
+  tailbeam version
 
 Start send first, then run receive on the destination. Both commands must remain
 running during the transfer. Hosts may be MagicDNS names, Tailscale IPs, or node IDs.
@@ -64,6 +68,10 @@ func main() {
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] == "help" || args[0] == "--help" || args[0] == "-h" {
 		fmt.Print(usage)
+		return nil
+	}
+	if args[0] == "version" || args[0] == "--version" {
+		fmt.Println("tailbeam", version)
 		return nil
 	}
 	mode := args[0]
