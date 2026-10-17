@@ -184,3 +184,19 @@ the connection. Repeat with the daemon stopped and an existing destination file;
 both operations should fail safely. Test one transfer per sender/port; use a
 different `--port` for concurrent offers. There is no directory/archive
 handling, compression, parallel streaming, or background queue in this version.
+
+## Releases
+
+Release builds use [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`) for
+linux, darwin and windows on amd64 and arm64. To build everything locally without
+publishing anything:
+
+```sh
+go install github.com/goreleaser/goreleaser/v2@latest
+goreleaser check
+goreleaser release --snapshot --clean
+```
+
+Archives and `checksums.txt` are written to `dist/` (git-ignored). Pushing a `v*`
+tag runs `.github/workflows/release.yml`, which creates a draft GitHub release.
+Binaries are not yet code-signed or notarized.
