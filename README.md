@@ -41,3 +41,7 @@ TCP 8784 from the receiver to the sender.
 - [Development and releases](docs/development.md).
 
 Tailbeam is new and has not been independently audited.
+
+## License
+
+[Apache License 2.0](LICENSE).
