@@ -132,7 +132,7 @@ func download(t *testing.T, ctx context.Context, h http.Handler, dir string) (st
 	t.Helper()
 	ts := httptest.NewServer(h)
 	defer ts.Close()
-	r, err := FetchAnyOffer(ctx, ts.Client(), ts.URL)
+	r, err := FetchPlainOffer(ctx, ts.Client(), ts.URL)
 	if err != nil {
 		return "", err
 	}
@@ -409,7 +409,7 @@ func TestV2ParallelStreams(t *testing.T) {
 	g := &gate{h: senderV2(t, writeSource(t, data), allow)}
 	ts := httptest.NewServer(g)
 	defer ts.Close()
-	r, err := FetchAnyOffer(context.Background(), ts.Client(), ts.URL)
+	r, err := FetchPlainOffer(context.Background(), ts.Client(), ts.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -583,7 +583,7 @@ func TestV2HostileManifestsAndRanges(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			r, err := FetchAnyOffer(context.Background(), ts.Client(), ts.URL)
+			r, err := FetchPlainOffer(context.Background(), ts.Client(), ts.URL)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -654,27 +654,18 @@ func TestV2ServeRange(t *testing.T) {
 	}
 }
 
-func TestV2FallsBackToV1(t *testing.T) {
-	data := []byte("v1 sender data")
-	s := sender(t, data, allow)
-	ts := httptest.NewServer(s)
+func TestV2NoDowngrade(t *testing.T) {
+	// A server without the v2 endpoint (such as a removed v1 sender) is an
+	// error, not a fallback.
+	ts := httptest.NewServer(http.NotFoundHandler())
 	defer ts.Close()
-	r, err := FetchAnyOffer(context.Background(), ts.Client(), ts.URL)
-	if err != nil || r.Version != 1 || r.Name != "example.bin" || r.Size != int64(len(data)) {
-		t.Fatalf("fallback failed: %+v %v", r, err)
+	if _, err := FetchPlainOffer(context.Background(), ts.Client(), ts.URL); err == nil {
+		t.Fatal("accepted a server without a v2 offer")
 	}
-	path, err := r.Download(context.Background(), ts.Client(), ts.URL, testSender, t.TempDir(), 1024, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := os.ReadFile(path); !bytes.Equal(got, data) {
-		t.Fatal("mismatch")
-	}
-
-	// A v2 sender that refuses for any other reason is not downgraded.
-	ts2 := httptest.NewServer(senderV2(t, writeSource(t, data), func(context.Context, string) error { return errors.New("no") }))
+	// A sender that refuses the peer gives no offer.
+	ts2 := httptest.NewServer(senderV2(t, writeSource(t, []byte("data")), func(context.Context, string) error { return errors.New("no") }))
 	defer ts2.Close()
-	if _, err := FetchAnyOffer(context.Background(), ts2.Client(), ts2.URL); err == nil {
+	if _, err := FetchPlainOffer(context.Background(), ts2.Client(), ts2.URL); err == nil {
 		t.Fatal("unauthorized offer accepted")
 	}
 }
@@ -684,18 +675,25 @@ func TestV2GatesOnEveryEndpoint(t *testing.T) {
 	deny := func(context.Context, string) error { lookedUp.Store(true); return errors.New("wrong node") }
 	s := senderV2(t, writeSource(t, []byte("secret data")), deny)
 	paths := [][2]string{{"GET", "/v2/offer"}, {"GET", "/v2/manifest/" + s.Offer.ID}, {"GET", "/v2/file/" + s.Offer.ID}, {"POST", "/v2/ack/" + s.Offer.ID}}
-	for _, kind := range []string{"unauthorized", "no guard", "origin", "fetch metadata"} {
+	for _, kind := range []string{"unauthorized", "no guard", "wrong guard", "origin", "fetch metadata", "DNS rebinding"} {
 		for _, mp := range paths {
 			r := httptest.NewRequest(mp[0], mp[1], nil)
 			r.RemoteAddr = "100.64.0.3:5555"
-			if kind != "no guard" {
+			if kind != "no guard" && kind != "DNS rebinding" {
 				r.Header.Set(browserGuardHeader, browserGuardValue)
 			}
 			switch kind {
+			case "unauthorized":
+				// Proxy headers must never stand in for the TCP peer.
+				r.Header.Set("X-Forwarded-For", "100.64.0.2")
+			case "wrong guard":
+				r.Header.Set(browserGuardHeader, "setec")
 			case "origin":
 				r.Header.Set("Origin", "https://evil.example")
 			case "fetch metadata":
 				r.Header.Set("Sec-Fetch-Site", "same-origin")
+			case "DNS rebinding":
+				r.Host = "evil.example:8784"
 			}
 			lookedUp.Store(false)
 			w := httptest.NewRecorder()

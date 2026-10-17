@@ -47,7 +47,6 @@ TAILBEAM_CODE=mfrg-… tailbeam receive       # code only: discovers the sender
 | `--deadline` | both | none | Absolute cap on the whole command |
 | `--socket` | both | platform default | Path to the `tailscaled` socket |
 | `--plaintext` | both | off | Rely on WireGuard only, with no code; both sides must use it |
-| `--v1` | send | off | With `--plaintext`: serve protocol v1 for receivers older than v2 |
 | `--no-cache` | send | off | Re-hash a large file even if its manifest is cached |
 | `--dir` | receive | `.` | Existing output directory |
 | `--max-bytes` | receive | 1 GiB | Largest file accepted |
@@ -78,12 +77,12 @@ busy Celeron N3160 host. More streams competed with `tailscaled` for CPU.
 Between faster machines, or over long and lossy paths, try `--streams 4`.
 Measurements are in [protocol-v2.md](protocol-v2.md).
 
-## Plaintext mode and compatibility
+## Plaintext mode
 
 `--plaintext` must be given on both sides. A mismatch fails with a message
-naming the other side's mode; it never falls back silently. In plaintext mode a
-receiver also accepts offers from v1 senders, and `send --plaintext --v1` serves
-receivers older than v2. v1 has no resume.
+naming the other side's mode; it never falls back silently. Plaintext mode
+keeps chunking, resume and every identity check; it only drops the transfer
+code and the end-to-end encryption.
 
 ## File names and output
 

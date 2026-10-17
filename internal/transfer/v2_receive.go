@@ -61,43 +61,30 @@ func v2Request(ctx context.Context, c *http.Client, method, url, rangeHeader str
 	return resp, nil
 }
 
-// Remote is an offer of either protocol version. Name and Size are validated.
+// Remote is a plaintext offer. Name and Size are validated.
 type Remote struct {
-	Version int
-	Name    string
-	Size    int64
-	// Streams is the number of parallel range requests for a v2 download;
+	Name string
+	Size int64
+	// Streams is the number of parallel range requests for the download;
 	// zero means DefaultStreams.
 	Streams int
-	v1      Offer
-	v2      OfferV2
+	o       OfferV2
 }
 
-// FetchAnyOffer prefers v2 and falls back to v1 only when the sender does not
-// know the v2 endpoint. Both versions apply the same peer authentication.
-func FetchAnyOffer(ctx context.Context, c *http.Client, base string) (Remote, error) {
-	o2, err := FetchOfferV2(ctx, c, base)
-	if err == nil {
-		return Remote{Version: 2, Name: o2.Name, Size: o2.Size, v2: o2}, nil
-	}
-	var se statusError
-	if !errors.As(err, &se) || se != http.StatusNotFound {
-		return Remote{}, err
-	}
-	o1, err := FetchOffer(ctx, c, base)
+// FetchPlainOffer fetches and validates a plaintext offer. An encrypted
+// sender answers with ErrSenderEncrypted, never with a plaintext offer.
+func FetchPlainOffer(ctx context.Context, c *http.Client, base string) (Remote, error) {
+	o, err := FetchOfferV2(ctx, c, base)
 	if err != nil {
 		return Remote{}, err
 	}
-	return Remote{Version: 1, Name: o1.Name, Size: o1.Size, v1: o1}, nil
+	return Remote{Name: o.Name, Size: o.Size, o: o}, nil
 }
 
-// Download fetches the offer with either protocol. idle bounds how long a
-// response may stall; zero uses the default for v2 and disables it for v1.
+// Download fetches the offer. idle bounds how long a response may stall;
+// zero uses the default.
 func (r Remote) Download(ctx context.Context, c *http.Client, base, sender, dir string, maxBytes int64, idle time.Duration) (string, error) {
-	if r.Version == 2 {
-		return downloadChunked(ctx, r.v2, sender, dir, maxBytes, idle, r.Streams, &plainSource{c: c, base: base, o: r.v2})
-	}
-	return DownloadIdle(ctx, c, base, r.v1, dir, maxBytes, idle)
+	return downloadChunked(ctx, r.o, sender, dir, maxBytes, idle, r.Streams, &plainSource{c: c, base: base, o: r.o})
 }
 
 func FetchOfferV2(ctx context.Context, c *http.Client, base string) (OfferV2, error) {
@@ -521,8 +508,8 @@ func (d *v2Fetch) fetch(ctx context.Context, present []bool, streams int) error 
 
 // DownloadV2 resumes or starts a chunked download. On failure the verified
 // chunks stay in a private partial file, and a rerun against the same sender
-// and file name continues from them. Like v1, only a complete file whose
-// chunks all match the root is published, without replacing anything.
+// and file name continues from them. Only a complete file whose chunks all
+// match the root is published, without replacing anything.
 func DownloadV2(ctx context.Context, c *http.Client, base string, o OfferV2, sender, dir string, maxBytes int64) (string, error) {
 	return DownloadV2Idle(ctx, c, base, o, sender, dir, maxBytes, 0)
 }

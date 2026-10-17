@@ -3,7 +3,10 @@ package transfer
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -11,40 +14,226 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func TestStrictNames(t *testing.T) {
-	for _, name := range []string{
-		".profile", ".envrc", ".npmrc", ".hidden.txt",
-		"a\u202eb.txt", "a\u2066b", "a\u200bb", "a\u00adb", "a\ufeffb", // bidi, zero-width, soft hyphen, BOM
-		"a\u0085b", "a\u009fb", "a\x7fb", "a\tb", "a\u00a0b", "a\u2028b",
-		"bad\xffutf8", "\xc3",
-	} {
-		if err := validName(name); err == nil {
-			t.Errorf("accepted %q", name)
+// intercepted serves h, letting intercept answer a request first; intercept
+// returns true when it has written the response.
+func intercepted(t *testing.T, h http.Handler, intercept func(w http.ResponseWriter, r *http.Request) bool) *httptest.Server {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if intercept != nil && intercept(w, r) {
+			return
 		}
+		h.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func plainDownload(ctx context.Context, ts *httptest.Server, dir string, max int64, idle time.Duration) (string, error) {
+	r, err := FetchPlainOffer(ctx, ts.Client(), ts.URL)
+	if err != nil {
+		return "", err
 	}
-	for _, name := range []string{"résumé.pdf", "日本語.txt", "a b.tar.gz", "emoji🙂.png", "x.profile"} {
-		if err := validName(name); err != nil {
-			t.Errorf("%q: %v", name, err)
-		}
+	return r.Download(ctx, ts.Client(), ts.URL, testSender, dir, max, idle)
+}
+
+// rangeHeaders writes the 206 headers for the request's range of s's file and
+// returns that range.
+func rangeHeaders(w http.ResponseWriter, r *http.Request, s *SenderV2) (start, end int64) {
+	start, end, _, _ = v2ParseRange(r.Header.Get("Range"), s.Offer.Size)
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, s.Offer.Size))
+	w.Header().Set("Content-Length", fmt.Sprint(end-start))
+	w.WriteHeader(http.StatusPartialContent)
+	return start, end
+}
+
+func isFile(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, "/v2/file/") }
+func isAck(r *http.Request) bool  { return strings.HasPrefix(r.URL.Path, "/v2/ack/") }
+
+func TestV2FailedDownloadsNotPublishedOrAcked(t *testing.T) {
+	data := randomData(2*testChunk+5, 7)
+	for _, kind := range []string{"truncated", "corrupt", "limit"} {
+		t.Run(kind, func(t *testing.T) {
+			s := senderV2(t, writeSource(t, data), allow)
+			var h http.Handler = s
+			if kind == "corrupt" {
+				h = &tap{h: s, flip: func(int) int64 { return 0 }}
+			}
+			var acked atomic.Bool
+			ts := intercepted(t, h, func(w http.ResponseWriter, r *http.Request) bool {
+				switch {
+				case isAck(r):
+					acked.Store(true)
+					w.WriteHeader(http.StatusNoContent)
+					return true
+				case kind == "truncated" && isFile(r):
+					start, end := rangeHeaders(w, r, s)
+					w.Write(data[start : start+(end-start)/2])
+					return true
+				}
+				return false
+			})
+			max := int64(1 << 30)
+			if kind == "limit" {
+				max = 1
+			}
+			dir := t.TempDir()
+			if _, err := plainDownload(context.Background(), ts, dir, max, 0); err == nil {
+				t.Fatal("accepted failed download")
+			}
+			if _, err := os.Lstat(filepath.Join(dir, "example.bin")); err == nil || acked.Load() {
+				t.Fatal("published or acknowledged a failed download")
+			}
+		})
 	}
 }
 
-func TestSenderRejectsDotfile(t *testing.T) {
-	p := filepath.Join(t.TempDir(), ".envrc")
-	if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
+func TestV2NoOverwriteOrSymlinkFollow(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		t.Run(fmt.Sprint(symlink), func(t *testing.T) {
+			s := senderV2(t, writeSource(t, []byte("new")), allow)
+			ts := httptest.NewServer(s)
+			defer ts.Close()
+			dir := t.TempDir()
+			dest := filepath.Join(dir, s.Offer.Name)
+			target := dest
+			if symlink {
+				target = filepath.Join(t.TempDir(), "valuable")
+				if err := os.Symlink(target, dest); err != nil {
+					t.Skip(err)
+				}
+			}
+			if err := os.WriteFile(target, []byte("keep me"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := plainDownload(context.Background(), ts, dir, 1024, 0); err == nil {
+				t.Fatal("overwrote destination")
+			}
+			if got, _ := os.ReadFile(target); string(got) != "keep me" {
+				t.Fatal("existing data was modified")
+			}
+		})
+	}
+}
+
+func TestV2AckFailurePreservesVerifiedFile(t *testing.T) {
+	data := []byte("verified")
+	s := senderV2(t, writeSource(t, data), allow)
+	ts := intercepted(t, s, func(w http.ResponseWriter, r *http.Request) bool {
+		if isAck(r) {
+			http.Error(w, "failure", 500)
+			return true
+		}
+		return false
+	})
+	dest, err := plainDownload(context.Background(), ts, t.TempDir(), 1024, 0)
+	if dest == "" || err == nil || !strings.Contains(err.Error(), "acknowledgement failed") {
+		t.Fatalf("%q: %v", dest, err)
+	}
+	if got, _ := os.ReadFile(dest); !bytes.Equal(got, data) {
+		t.Fatal("lost verified download")
+	}
+}
+
+func TestV2DestinationCreatedDuringTransfer(t *testing.T) {
+	s := senderV2(t, writeSource(t, []byte("new")), allow)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, s.Offer.Name)
+	var once sync.Once
+	ts := intercepted(t, s, func(w http.ResponseWriter, r *http.Request) bool {
+		if isFile(r) {
+			once.Do(func() {
+				if err := os.WriteFile(dest, []byte("winner"), 0600); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		return false
+	})
+	if _, err := plainDownload(context.Background(), ts, dir, 1024, 0); err == nil {
+		t.Fatal("overwrote concurrent file")
+	}
+	if got, _ := os.ReadFile(dest); string(got) != "winner" {
+		t.Fatal("concurrent file modified")
+	}
+}
+
+func TestV2SourceMutationDetected(t *testing.T) {
+	path := writeSource(t, []byte("before"))
+	s := senderV2(t, path, allow)
+	if err := os.WriteFile(path, []byte("after!"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewSender(context.Background(), p, allow); err == nil || !strings.Contains(err.Error(), "dot") {
-		t.Fatalf("got %v", err)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+	dir := t.TempDir()
+	if _, err := plainDownload(context.Background(), ts, dir, 1024, 0); err == nil {
+		t.Fatal("accepted mutated source")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "example.bin")); err == nil {
+		t.Fatal("published a mutated source")
 	}
 }
 
-func TestCompletedOfferGoneEverywhere(t *testing.T) {
-	s := sender(t, []byte("data"), allow)
+func TestV2OfferLimits(t *testing.T) {
+	for _, body := range []string{strings.Repeat("x", maxMetadata+1), `{"version":1}`, `{"version":2,"size":-1}`} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) }))
+		_, err := FetchPlainOffer(context.Background(), ts.Client(), ts.URL)
+		ts.Close()
+		if err == nil {
+			t.Fatalf("accepted invalid offer %.40q", body)
+		}
+	}
+}
+
+func TestV2ServeLifecycle(t *testing.T) {
+	for _, acknowledge := range []bool{true, false} {
+		t.Run(fmt.Sprint(acknowledge), func(t *testing.T) {
+			s := senderV2(t, writeSource(t, []byte("hello")), allow)
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- ServeV2(ctx, l, s) }()
+			if acknowledge {
+				c := &http.Client{Timeout: 3 * time.Second}
+				defer c.CloseIdleConnections()
+				base := "http://" + l.Addr().String()
+				r, err := FetchPlainOffer(ctx, c, base)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := r.Download(ctx, c, base, testSender, t.TempDir(), 1024, 0); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if acknowledge && err != nil {
+					t.Fatal(err)
+				}
+				if !acknowledge && !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation returned %v", err)
+				}
+			case <-time.After(6 * time.Second):
+				t.Fatal("sender failed to stop")
+			}
+		})
+	}
+}
+
+func TestV2CompletedOfferGoneEverywhere(t *testing.T) {
+	s := senderV2(t, writeSource(t, []byte("data")), allow)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 	do := func(method, path string) int {
@@ -57,10 +246,10 @@ func TestCompletedOfferGoneEverywhere(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode
 	}
-	if do("POST", "/v1/ack/"+s.Offer.ID) != http.StatusNoContent {
+	if do("POST", "/v2/ack/"+s.Offer.ID) != http.StatusNoContent {
 		t.Fatal("ack failed")
 	}
-	for _, c := range [][2]string{{"GET", "/v1/offer"}, {"GET", "/v1/file/" + s.Offer.ID}, {"POST", "/v1/ack/" + s.Offer.ID}} {
+	for _, c := range [][2]string{{"GET", "/v2/offer"}, {"GET", "/v2/manifest/" + s.Offer.ID}, {"GET", "/v2/file/" + s.Offer.ID}, {"POST", "/v2/ack/" + s.Offer.ID}} {
 		if code := do(c[0], c[1]); code != http.StatusGone {
 			t.Errorf("%v: %d", c, code)
 		}
@@ -68,10 +257,10 @@ func TestCompletedOfferGoneEverywhere(t *testing.T) {
 }
 
 // A black-holed client must neither block retries nor hold its handler forever.
-func TestStalledClientDoesNotBlockRetry(t *testing.T) {
+func TestV2StalledClientDoesNotBlockRetry(t *testing.T) {
 	data := bytes.Repeat([]byte{7}, 64<<20)
-	s := sender(t, data, allow)
-	s.writeTimeout = 300 * time.Millisecond
+	s := senderV2(t, writeSource(t, data), allow)
+	s.writeIdle = 300 * time.Millisecond
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
@@ -80,20 +269,14 @@ func TestStalledClientDoesNotBlockRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	req := "GET /v1/file/" + s.Offer.ID + " HTTP/1.1\r\nHost: x\r\n" + browserGuardHeader + ": " + browserGuardValue + "\r\n\r\n"
+	req := "GET /v2/file/" + s.Offer.ID + " HTTP/1.1\r\nHost: x\r\n" + browserGuardHeader + ": " + browserGuardValue + "\r\n\r\n"
 	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond) // handler is now blocked writing
 
-	// Concurrent retry succeeds immediately instead of 409.
-	o, err := FetchOffer(context.Background(), ts.Client(), ts.URL)
-	if err != nil {
-		t.Fatalf("retry during stall: %v", err)
-	}
-	if _, err := Download(context.Background(), ts.Client(), ts.URL, o, t.TempDir(), 1<<30); err == nil {
-		t.Log("download during stall completed") // acked, offer now consumed
-	} else {
+	// A concurrent download succeeds while the stalled one is stuck.
+	if _, err := plainDownload(context.Background(), ts, t.TempDir(), 1<<30, 0); err != nil {
 		t.Fatalf("download during stall: %v", err)
 	}
 
@@ -106,60 +289,62 @@ func TestStalledClientDoesNotBlockRetry(t *testing.T) {
 	}
 }
 
-func TestIdleTimeoutAbortsDownload(t *testing.T) {
-	s := sender(t, []byte("0123456789"), allow)
+func TestV2IdleTimeoutAbortsDownload(t *testing.T) {
+	data := []byte("0123456789")
+	s := senderV2(t, writeSource(t, data), allow)
 	release := make(chan struct{})
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "10")
-		w.Write([]byte("01234"))
+	defer close(release)
+	ts := intercepted(t, s, func(w http.ResponseWriter, r *http.Request) bool {
+		if !isFile(r) {
+			return false
+		}
+		rangeHeaders(w, r, s)
+		w.Write(data[:5])
 		w.(http.Flusher).Flush()
 		select {
 		case <-release:
 		case <-r.Context().Done():
 		}
-	}))
-	defer ts.Close()
-	defer close(release)
+		return true
+	})
 	dir := t.TempDir()
 	start := time.Now()
-	_, err := DownloadIdle(context.Background(), ts.Client(), ts.URL, s.Offer, dir, 1024, 200*time.Millisecond)
-	if !errors.Is(err, errIdle) {
-		t.Fatalf("got %v", err)
+	if _, err := plainDownload(context.Background(), ts, dir, 1024, 200*time.Millisecond); err == nil {
+		t.Fatal("stalled download succeeded")
 	}
 	if time.Since(start) > 3*time.Second {
 		t.Fatal("watchdog too slow")
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatal("left files behind")
+	if _, err := os.Lstat(filepath.Join(dir, "example.bin")); err == nil {
+		t.Fatal("published a stalled download")
 	}
 }
 
-func TestIdleTimeoutDoesNotCapSlowProgress(t *testing.T) {
+func TestV2IdleTimeoutDoesNotCapSlowProgress(t *testing.T) {
 	data := []byte("0123456789")
-	s := sender(t, data, allow)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			w.WriteHeader(http.StatusNoContent)
-			return
+	s := senderV2(t, writeSource(t, data), allow)
+	ts := intercepted(t, s, func(w http.ResponseWriter, r *http.Request) bool {
+		if !isFile(r) {
+			return false
 		}
-		w.Header().Set("Content-Length", "10")
-		for i := range data {
+		start, end := rangeHeaders(w, r, s)
+		for i := start; i < end; i++ {
 			w.Write(data[i : i+1])
 			w.(http.Flusher).Flush()
 			time.Sleep(60 * time.Millisecond) // total 600ms > idle 250ms
 		}
-	}))
-	defer ts.Close()
-	if _, err := DownloadIdle(context.Background(), ts.Client(), ts.URL, s.Offer, t.TempDir(), 1024, 250*time.Millisecond); err != nil {
+		return true
+	})
+	if _, err := plainDownload(context.Background(), ts, t.TempDir(), 1024, 250*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestStartedClosesOnFileRequestOnly(t *testing.T) {
-	s := sender(t, []byte("x"), allow)
+func TestV2StartedClosesOnDataRequestOnly(t *testing.T) {
+	s := senderV2(t, writeSource(t, []byte("x")), allow)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
-	if _, err := FetchOffer(context.Background(), ts.Client(), ts.URL); err != nil {
+	if _, err := FetchPlainOffer(context.Background(), ts.Client(), ts.URL); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -167,7 +352,7 @@ func TestStartedClosesOnFileRequestOnly(t *testing.T) {
 		t.Fatal("offer fetch counted as transfer start")
 	default:
 	}
-	if _, err := Download(context.Background(), ts.Client(), ts.URL, s.Offer, t.TempDir(), 10); err != nil {
+	if _, err := plainDownload(context.Background(), ts, t.TempDir(), 10, 0); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -177,41 +362,37 @@ func TestStartedClosesOnFileRequestOnly(t *testing.T) {
 	}
 }
 
-func TestInsufficientSpaceFailsFast(t *testing.T) {
+func TestV2InsufficientSpaceFailsFast(t *testing.T) {
 	dir := t.TempDir()
-	if _, ok, err := freeSpace(dir); err != nil || !ok {
-		t.Skip("free-space check unsupported on this platform")
+	const size = 1 << 40
+	if free, ok, err := freeSpace(dir); err != nil || !ok || free >= size {
+		t.Skip("free-space check unsupported here, or the disk is larger than the test file")
 	}
-	o := Offer{Version: 1, ID: strings.Repeat("00", 32), Name: "big", Size: 1 << 62, SHA256: strings.Repeat("00", 32)}
-	called := false
-	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	o := OfferV2{2, strings.Repeat("ab", 32), "big", size, v2MaxChunk, v2Hash, ""}
+	manifest := make([]byte, o.chunks()*v2ChunkHashSize)
+	o.Root = hex.EncodeToString(v2Root(o.Size, o.ChunkSize, manifest))
+	var called atomic.Bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v2/offer":
+			json.NewEncoder(w).Encode(o)
+		case strings.HasPrefix(r.URL.Path, "/v2/manifest/"):
+			w.Header().Set("Content-Length", fmt.Sprint(len(manifest)))
+			w.Write(manifest)
+		default:
+			called.Store(true)
+			http.Error(w, "unexpected", 500)
+		}
+	}))
 	defer ts.Close()
-	_, err := Download(context.Background(), ts.Client(), ts.URL, o, dir, 1<<62)
+	_, err := plainDownload(context.Background(), ts, dir, 1<<62, 0)
 	if err == nil || !strings.Contains(err.Error(), "free space") {
 		t.Fatalf("got %v", err)
 	}
-	if called {
-		t.Fatal("requested file despite insufficient space")
+	if called.Load() {
+		t.Fatal("requested file data despite insufficient space")
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
-		t.Fatal("left files behind")
-	}
-}
-
-func TestPreallocateKeepsSizeAndMode(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if err := preallocate(f, 1<<20); err != nil {
-		t.Fatal(err)
-	}
-	st, _ := f.Stat()
-	if st.Size() != 0 || st.Mode().Perm() != 0600 {
-		t.Fatalf("size %d mode %v", st.Size(), st.Mode())
-	}
-	if err := syncDir(filepath.Dir(f.Name())); err != nil {
-		t.Fatal(err)
+	if _, err := os.Lstat(filepath.Join(dir, "big")); err == nil {
+		t.Fatal("published a file")
 	}
 }

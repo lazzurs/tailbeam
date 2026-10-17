@@ -171,7 +171,7 @@ func (s *SenderE2E) session(r *http.Request) (e2e.Keys, bool) {
 }
 
 func (s *SenderE2E) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// The same gates as v1 and v2, in the same order: browser guard, identity.
+	// The same gates as plaintext v2, in the same order: browser guard, identity.
 	if r.Header.Get(browserGuardHeader) != browserGuardValue || r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") != "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -313,7 +313,7 @@ func (s *SenderE2E) manifest(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprint(len(sealed)))
-	v2Copy(w, bytes.NewReader(sealed))
+	v2Copy(w, bytes.NewReader(sealed), v2WriteIdle)
 }
 
 // e2eChunkRange parses first and last chunk indexes from the query.
