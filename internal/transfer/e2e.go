@@ -400,11 +400,6 @@ func ServeE2E(ctx context.Context, l net.Listener, s *SenderE2E) error {
 	srv := &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 8 << 10}
 	result := make(chan error, 1)
 	go func() { result <- srv.Serve(l) }()
-	shutdown := func() error {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
-	}
 	select {
 	case err := <-result:
 		return err
@@ -412,9 +407,9 @@ func ServeE2E(ctx context.Context, l net.Listener, s *SenderE2E) error {
 		srv.Close()
 		return ctx.Err()
 	case <-s.Done():
-		return shutdown()
+		return shutdownAfterAck(srv)
 	case <-s.Burned():
-		shutdown()
+		shutdownAfterAck(srv)
 		return ErrOfferBurned
 	}
 }

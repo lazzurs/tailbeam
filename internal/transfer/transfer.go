@@ -204,10 +204,22 @@ func Serve(ctx context.Context, l net.Listener, s *Sender) error {
 		srv.Close()
 		return ctx.Err()
 	case <-s.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		return shutdownAfterAck(srv)
 	}
+}
+
+// shutdownAfterAck stops the server once the receiver has acknowledged. The
+// transfer is complete, so connections that are still open (for example an
+// idle parallel stream that never sent a request, which Shutdown waits on for
+// 5 seconds) are closed rather than reported as an error.
+func shutdownAfterAck(srv *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := srv.Shutdown(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return srv.Close()
+	}
+	return err
 }
 
 // Client uses a fixed daemon-supplied Tailscale address. It bypasses proxies,

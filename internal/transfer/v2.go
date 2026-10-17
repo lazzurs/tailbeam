@@ -412,8 +412,6 @@ func ServeV2(ctx context.Context, l net.Listener, s *SenderV2) error {
 		srv.Close()
 		return ctx.Err()
 	case <-s.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		return shutdownAfterAck(srv)
 	}
 }
