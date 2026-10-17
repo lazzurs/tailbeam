@@ -105,8 +105,21 @@ func v2Root(size, chunk int64, manifest []byte) []byte {
 // v2HashChunks hashes every chunk of f using a bounded worker pool.
 func v2HashChunks(ctx context.Context, f io.ReaderAt, size, chunk int64) ([]byte, error) {
 	o := OfferV2{Size: size, ChunkSize: chunk}
-	count := o.chunks()
-	out := make([]byte, count*v2ChunkHashSize)
+	out := make([]byte, o.chunks()*v2ChunkHashSize)
+	if err := v2HashInto(ctx, f, o, nil, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// v2HashInto writes the hash of each listed chunk (all chunks when list is
+// nil) to its slot in out, using a bounded worker pool.
+func v2HashInto(ctx context.Context, f io.ReaderAt, o OfferV2, list []int64, out []byte) error {
+	chunk := o.ChunkSize
+	count := int64(len(list))
+	if list == nil {
+		count = o.chunks()
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan int64)
@@ -138,7 +151,11 @@ func v2HashChunks(ctx context.Context, f io.ReaderAt, size, chunk int64) ([]byte
 		}()
 	}
 feed:
-	for i := range count {
+	for k := range count {
+		i := k
+		if list != nil {
+			i = list[k]
+		}
 		select {
 		case jobs <- i:
 		case <-ctx.Done():
@@ -148,9 +165,9 @@ feed:
 	close(jobs)
 	wg.Wait()
 	if firstErr != nil {
-		return nil, firstErr
+		return firstErr
 	}
-	return out, ctx.Err()
+	return ctx.Err()
 }
 
 type SenderV2 struct {
@@ -166,12 +183,14 @@ type SenderV2 struct {
 	startOnce sync.Once
 }
 
-func NewSenderV2(ctx context.Context, path string, authorize Authorize) (*SenderV2, error) {
-	return newSenderV2(ctx, path, authorize, 0)
+// NewSenderV2 prepares a plaintext v2 offer. cacheDir holds cached manifests
+// of large files (see manifestcache.go); "" disables the cache.
+func NewSenderV2(ctx context.Context, path string, authorize Authorize, cacheDir string) (*SenderV2, error) {
+	return newSenderV2(ctx, path, authorize, 0, cacheDir)
 }
 
 // newSenderV2 uses chunk as the chunk size, or picks one when it is zero.
-func newSenderV2(ctx context.Context, path string, authorize Authorize, chunk int64) (*SenderV2, error) {
+func newSenderV2(ctx context.Context, path string, authorize Authorize, chunk int64, cacheDir string) (*SenderV2, error) {
 	if authorize == nil {
 		return nil, errors.New("missing peer authorization")
 	}
@@ -203,16 +222,27 @@ func newSenderV2(ctx context.Context, path string, authorize Authorize, chunk in
 	if (OfferV2{Size: size, ChunkSize: chunk}).chunks() > v2MaxChunks {
 		return nil, errors.New("file is too large for protocol v2")
 	}
-	manifest, err := v2HashChunks(ctx, f, size, chunk)
-	if err != nil {
-		return nil, err
+	cachePath, cacheKey, cacheable := manifestCacheEntry(cacheDir, st, chunk)
+	var manifest []byte
+	if cacheable {
+		manifest = loadManifest(cachePath, cacheKey, (OfferV2{Size: size, ChunkSize: chunk}).chunks()*v2ChunkHashSize)
 	}
-	after, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if after.Size() != size || !after.ModTime().Equal(st.ModTime()) {
-		return nil, errors.New("file changed while hashing")
+	if manifest == nil {
+		if manifest, err = v2HashChunks(ctx, f, size, chunk); err != nil {
+			return nil, err
+		}
+		after, err := f.Stat()
+		if err != nil {
+			return nil, err
+		}
+		if after.Size() != size || !after.ModTime().Equal(st.ModTime()) {
+			return nil, errors.New("file changed while hashing")
+		}
+		if id, ok := fileIdentity(after); cacheable && ok {
+			if before, _ := fileIdentity(st); before == id {
+				storeManifest(cacheDir, cachePath, cacheKey, manifest)
+			}
+		}
 	}
 	var token [32]byte
 	if _, err := rand.Read(token[:]); err != nil {

@@ -102,15 +102,15 @@ type SenderE2E struct {
 
 // NewSenderE2E hashes the file and prepares an encrypted offer for code,
 // bound to the sender's and receiver's stable node IDs (from the local daemon).
-func NewSenderE2E(ctx context.Context, path string, authorize Authorize, code e2e.Code, senderID, receiverID string) (*SenderE2E, error) {
-	return newSenderE2E(ctx, path, authorize, code, senderID, receiverID, 0)
+func NewSenderE2E(ctx context.Context, path string, authorize Authorize, code e2e.Code, senderID, receiverID, cacheDir string) (*SenderE2E, error) {
+	return newSenderE2E(ctx, path, authorize, code, senderID, receiverID, 0, cacheDir)
 }
 
-func newSenderE2E(ctx context.Context, path string, authorize Authorize, code e2e.Code, senderID, receiverID string, chunk int64) (*SenderE2E, error) {
+func newSenderE2E(ctx context.Context, path string, authorize Authorize, code e2e.Code, senderID, receiverID string, chunk int64, cacheDir string) (*SenderE2E, error) {
 	if senderID == "" || receiverID == "" {
 		return nil, errors.New("missing node identity")
 	}
-	core, err := newSenderV2(ctx, path, authorize, chunk)
+	core, err := newSenderV2(ctx, path, authorize, chunk, cacheDir)
 	if err != nil {
 		return nil, err
 	}

@@ -60,6 +60,17 @@ cancellable) before it listens, and rejects the file if its size or
 modification time changed while hashing. The root is deterministic: the same
 file produces the same root after a sender restart.
 
+For files of 256 MiB or more, the sender caches the manifest in the user cache
+directory (`$XDG_CACHE_HOME/tailbeam/manifests` on Linux, private files in a
+0700 directory, entries unused for 30 days are pruned). An entry is keyed by
+device, inode, size, mtime, ctime and chunk size. Any write to the file changes
+its ctime, which ordinary tools cannot set back. A restarted sender, or a
+repeat send of the same file, then starts in well under a second: 1 GiB took
+13.6 s to hash on a Celeron N3160 and 0.08 s from the cache. A stale or
+tampered entry cannot make a receiver accept wrong data: the receiver checks
+every chunk against the manifest and refuses the file. `send --no-cache`
+skips the cache. Linux and macOS only; elsewhere the file is always hashed.
+
 ### Why SHA-256 and not BLAKE3
 
 Chunk-level parallelism already removes v1's single-core hashing bottleneck:
@@ -69,6 +80,13 @@ standard library avoids a new dependency in a security tool and keeps Go's
 FIPS-capable crypto. The `hash` field allows `blake3` to be added later
 without changing the protocol.
 
+CPUs without SHA extensions are much slower: a Celeron N3160 (a busy
+Proxmox host in testing) hashes about 42 MB/s per core. The receiver
+therefore hashes on every stream in parallel (see Receiver), and hashes each
+byte once. In a live test against that host, skipping the receiver's hash
+entirely made no measurable difference once two streams were used: the
+host's `tailscaled` was the limit. BLAKE3 stays deferred.
+
 ## File reads and Range
 
 `GET /v2/file/{id}` returns the whole file (200) or, with exactly one range
@@ -76,8 +94,11 @@ without changing the protocol.
 `last` past the end is clamped. Suffix ranges (`bytes=-n`), multiple ranges,
 whitespace, signs, `first >= size`, and any range on an empty file return 416.
 
-The receiver requests each contiguous run of missing chunks as one range and
-requires the exact `Content-Range` and `Content-Length` it asked for.
+The receiver splits the missing chunks into segments of consecutive chunks (at
+most 64 MiB, and small enough that every stream gets a share), requests each
+segment as one range, and requires the exact `Content-Range` and
+`Content-Length` it asked for. `--streams` (default 2, at most 8) segments are
+in flight at once, each on its own connection.
 
 Unlike v1, reads are not serialized behind the offer lock: up to 8 manifest or
 file requests may run at once (more get 429), and only `ack` takes the lock.
@@ -93,8 +114,11 @@ For sender stable ID `S` and file name `N`, with
 output directory, both mode 0600:
 
 * `.tailbeam-v2-<k>.part`: the file, preallocated as a sparse file of `size` bytes.
-* `.tailbeam-v2-<k>.state`: JSON `{version, sender, name, size, chunk_size, root, done}`,
-  where `done` is a bitmap of verified chunks (at most 512 KiB).
+* `.tailbeam-v2-<k>.state`: JSON `{version, sender, name, size, chunk_size, root}`,
+  written once when the partial file is created. It names the offer the
+  partial file belongs to; it does not record which chunks are present.
+  (State files from earlier builds also carry a `done` bitmap, which is
+  ignored.)
 
 The key uses the sender's identity and file name, not the offer ID or root, so a
 rerun finds the previous attempt even after the sender restarts or the source
@@ -104,28 +128,40 @@ are removed and the download starts over. Symlinks at either path are removed,
 never followed, and the partial file is created with `O_EXCL`.
 
 For each chunk, the receiver writes the bytes into the partial file at the
-chunk's offset while hashing them, compares the hash with the manifest, and
-only then sets the chunk's bit. Every 256 MiB or 10 seconds, and on any error,
-it syncs the partial file **before** writing the state (temp file, sync,
-rename), so a recorded bit never refers to unsynced data. A lost state update
-only causes chunks to be fetched again.
+chunk's offset while hashing them, and compares the hash with the manifest
+before the stream moves on. Nothing is synced or recorded during the transfer.
 
-Failures: a broken connection, a short body, or no bytes for `--idle-timeout` (default 5 minutes from the CLI, one minute for the library default) ends the
-current range request. The receiver checkpoints and retries from the next
-missing chunk, after 1 second if the attempt made progress. Attempts without
-progress wait 2 and then 4 seconds; the third consecutive one stops the download. A chunk that keeps failing its hash (for
-example a source modified in place) ends the download with an error naming
-it. Cancellation leaves the partial files in place; `receive` again with the
-same sender and output directory resumes.
+On resume, the receiver re-reads the partial file and keeps every chunk whose
+bytes hash to the manifest entry; it fetches the rest. On Linux it asks the
+filesystem for the file's data regions (`SEEK_DATA`/`SEEK_HOLE`) and reads
+only chunks that overlap them, so never-written ranges cost nothing; elsewhere
+it re-hashes every chunk. Acceptance is by hash alone, so it does not matter
+which writes reached the disk before a crash or `SIGKILL`: anything that
+survived and is correct is kept, and anything torn or corrupted is fetched
+again. Earlier builds instead synced the file and wrote a bitmap of verified
+chunks every 256 MiB or 10 seconds. That cost about 25% throughput on ZFS and
+lost everything written since the last checkpoint.
+
+Failures: a broken connection, a short body, or no bytes for `--idle-timeout`
+(default 5 minutes from the CLI, one minute for the library default) ends that
+stream's request, and its unfinished chunks go back on the queue. A stream
+retries at once after a request that made progress. Requests without progress
+back off 2 and then 4 seconds; the third consecutive one (across all streams)
+stops the download. A chunk that keeps failing its hash (for example a source
+modified in place) ends the download with an error naming it. Cancellation
+leaves the partial files in place; `receive` again with the same sender and
+output directory resumes.
 
 ## Publication
 
-When all bits are set, the receiver re-hashes the entire partial file in
-parallel and compares every chunk with the manifest. This guards against a
-corrupted or edited partial file or state, and against disk faults. Failed
-chunks are cleared and fetched again, once. Then, as in v1: `fsync`, then
-`link(part, dest)` (atomic, never replaces), remove the state and partial
-names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
+When every chunk is present, every byte of the partial file has been hashed
+against the manifest exactly once: either as it was written in this run, or
+as it was read back when resuming. There is no separate pass over the whole
+file. Such a pass would mostly have read the page cache, not the disk, so it
+did not meaningfully protect against disk faults, and it cost a full extra
+SHA-256 pass (about 6 seconds per GiB on four N3160 cores). Then, as in v1:
+`fsync`, then `link(part, dest)` (atomic, never replaces), remove the state and
+partial names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
 
 ## Security analysis
 
@@ -139,14 +175,15 @@ names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
   the same channel, so they prove consistency with the sender's claim, not the
   sender's honesty. This is the same as v1's whole-file hash.
 * **Hostile offers:** chunk size and count are bounded, so an authenticated
-  but hostile sender can make the receiver hold at most a 128 MiB manifest and
-  a 512 KiB bitmap, and write at most `--max-bytes`. `size` is checked
-  against `--max-bytes` before anything is allocated.
+  but hostile sender can make the receiver hold at most a 128 MiB manifest
+  (plus one byte per chunk of bookkeeping), and write at most `--max-bytes`.
+  `size` is checked against `--max-bytes` before anything is allocated.
 * **Local files:** resume files are private (0600, permission-checked on
   reuse, regular files only) and live in the output directory, which the model
   already requires to be trusted. Two concurrent receives of the same name
-  from the same sender into one directory are unsupported. Final verification
-  prevents a corrupt publish, but the attempts may interfere.
+  from the same sender into one directory are unsupported; they may interfere
+  and fail, and a chunk overwritten by the other attempt after it was verified
+  could be published. Another user cannot cause this: the files are private.
 * **Downgrade:** in plaintext mode the receiver falls back to v1 only when
   `/v2/offer` returns 404, and v1 is equally authenticated, so a downgrade
   loses resume but not authenticity. Encrypted and plaintext modes never fall
@@ -163,9 +200,18 @@ names, `fsync` the directory (not on Windows), then `POST /v2/ack/{id}`.
 
 ## Deferred
 
-* zstd compression per chunk, negotiated through `Accept-Encoding`.
-* Parallel range streams. The sender already allows 8 concurrent reads, and the
-  receiver writes by offset, so this is a receiver-only change.
+* zstd compression per chunk, negotiated through `Accept-Encoding`. Measured on
+  a 57 MB sample of a Proxmox host's logs on a Celeron N3160: `zstd -1` ratio
+  15.6×, compression 160 MB/s, decompression 440 MB/s (one core). Against a
+  link and receiver that top out near 25–60 MB/s, that would multiply
+  throughput for logs, dumps and text, and do nothing for media or
+  already-compressed archives. It is not a small change:
+  - **Framing:** plaintext v2 serves raw byte ranges, so it would need
+    per-chunk framing like the encrypted mode, plus a raw/compressed flag per
+    chunk so incompressible chunks are sent as is.
+  - **Lengths:** responses would lose their up-front `Content-Length`.
+  - **Leakage:** in encrypted mode, compressed sizes leak how compressible each
+    chunk is, so it should be opt-in there.
 * Delta transfer against an existing receiver file (`--base`), likely with
   content-defined chunking.
 * Streaming mode for unknown sizes (stdin, on-the-fly archives) and directories.
