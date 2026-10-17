@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: tailbeam
+
+before:
+  hooks:
+    - go mod verify
+    - go vet ./...
+
+builds:
+  - id: tailbeam
+    main: ./cmd/tailbeam
+    binary: tailbeam
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      # No version variable exists in the code yet; add
+      # -X main.version={{.Version}} once one is introduced.
+      - -s -w
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+# Extra universal (amd64+arm64) macOS binary, kept alongside the per-arch ones.
+universal_binaries:
+  - id: tailbeam-universal
+    ids: [tailbeam]
+    replace: false
+
+archives:
+  - id: default
+    ids: [tailbeam]
+    formats: [tar.gz]
+    name_template: "tailbeam_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - SECURITY.md
+      - LICENSE*   # no LICENSE file exists yet; glob matches nothing
+  - id: darwin-universal
+    ids: [tailbeam-universal]
+    formats: [tar.gz]
+    name_template: "tailbeam_{{ .Version }}_{{ .Os }}_universal"
+    files:
+      - README.md
+      - SECURITY.md
+      - LICENSE*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: git
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+# macOS signing and notarization (needs an Apple Developer ID certificate):
+# notarize:
+#   macos:
+#     - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+#       ids: [tailbeam-universal]
+#       sign:
+#         certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+#         password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+#       notarize:
+#         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+#         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+#         key: "{{ .Env.MACOS_NOTARY_KEY }}"
+#
+# Windows signing (Authenticode) would use a `signs:` section or a post-build
+# hook calling osslsigncode/signtool with a code-signing certificate.
+
+# Publishing stage. Only reached by a real `goreleaser release` (the CI
+# workflow on v* tags); `--snapshot` never publishes.
+release:
+  github:
+    owner: linuskendall
+    name: tailbeam
+  draft: true
+  prerelease: auto
