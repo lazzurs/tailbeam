@@ -2,30 +2,98 @@ package e2e
 
 import (
 	"bytes"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
 
-var bind = Binding{SenderID: "nSENDERCNTRL", ReceiverID: "nRECVRCNTRL", OfferID: "0123abcd"}
+func testBinding(c Code) Binding {
+	return Binding{SenderID: "nSENDERCNTRL", ReceiverID: "nRECVRCNTRL", OfferID: c.OfferID()}
+}
 
-func handshake(t *testing.T, sCode, rCode Code, sBind, rBind Binding) (*Session, *Session, error) {
+// handshake runs msg1, msg2 and the confirmation, returning the receiver's
+// view of the payload.
+func handshake(sCode, rCode Code, sBind, rBind Binding, payload []byte) ([]byte, error) {
+	init, msg1, err := Hello(rCode, rBind)
+	if err != nil {
+		return nil, err
+	}
+	p, msg2, err := Respond(sCode, sBind, msg1, payload)
+	if err != nil {
+		return nil, err
+	}
+	got, err := init.Finish(msg2)
+	if err != nil {
+		return nil, err
+	}
+	sid := []byte("session-handle")
+	confirm, err := init.Confirmation(sid)
+	if err != nil {
+		return nil, err
+	}
+	return got, p.Confirm(sid, confirm)
+}
+
+func TestProtocolName(t *testing.T) {
+	if got := ProtocolName(); got != "Noise_NNpsk0_25519_ChaChaPoly_SHA256" {
+		t.Fatalf("protocol name %q", got)
+	}
+}
+
+type fixedRand struct{ b []byte }
+
+func (r *fixedRand) Read(p []byte) (int, error) {
+	n := copy(p, r.b)
+	r.b = r.b[n:]
+	return n, nil
+}
+
+func unhex(t *testing.T, s string) []byte {
 	t.Helper()
-	priv, hello, err := NewHello()
+	b, err := hex.DecodeString(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss, reply, err := Respond(sCode, sBind, hello)
+	return b
+}
+
+// TestNoiseVector runs our handshake configuration against the
+// Noise_NNpsk0_25519_ChaChaPoly_SHA256 test vector shipped with flynn/noise
+// (vectors.txt), pinning the pattern, PSK placement and cipher suite.
+func TestNoiseVector(t *testing.T) {
+	psk := unhex(t, "2176657279736563726574766572797365637265747665727973656372657421")
+	ie := &fixedRand{unhex(t, "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")}
+	re := &fixedRand{unhex(t, "4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60")}
+	init, err := newHandshake(psk, nil, true, ie)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rs, confirm, err := Finish(rCode, rBind, priv, hello, reply)
+	resp, err := newHandshake(psk, nil, false, re)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := ss.VerifyReceiver(confirm); err != nil {
 		t.Fatal(err)
 	}
-	return ss, rs, nil
+	msg0, _, _, err := init.WriteMessage(nil, nil)
+	if err != nil || !bytes.Equal(msg0, unhex(t, "358072d6365880d1aeea329adf9121383851ed21a28e3b75e965d0d2cd166254e7136508cb8178281204abd62e9f2a3e")) {
+		t.Fatalf("msg0 %x %v", msg0, err)
+	}
+	if _, _, _, err := resp.ReadMessage(nil, msg0); err != nil {
+		t.Fatal(err)
+	}
+	msg1, rRecv, _, err := resp.WriteMessage(nil, nil)
+	if err != nil || !bytes.Equal(msg1, unhex(t, "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d48466922f3b7824001193c077abd8b7a73030")) {
+		t.Fatalf("msg1 %x %v", msg1, err)
+	}
+	_, iSend, _, err := init.ReadMessage(nil, msg1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg2, err := iSend.Encrypt(nil, nil, unhex(t, "79656c6c6f777375626d6172696e65"))
+	if err != nil || !bytes.Equal(msg2, unhex(t, "b349a522c145762c7c737ac1d1425ce1fb25c7cca626177ee4ceed3cd6fb3d")) {
+		t.Fatalf("msg2 %x %v", msg2, err)
+	}
+	if _, err := rRecv.Decrypt(nil, nil, msg2); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCodeRoundTrip(t *testing.T) {
@@ -45,6 +113,18 @@ func TestCodeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOfferIDIsOneWayAndDistinct(t *testing.T) {
+	c, _ := NewCode()
+	id := c.OfferID()
+	if len(id) != 32 || bytes.Equal(id, c.psk()) || bytes.Contains(id, c[:]) {
+		t.Fatal("offer ID must be a distinct 32-byte derivation")
+	}
+	d, _ := NewCode()
+	if bytes.Equal(id, d.OfferID()) {
+		t.Fatal("different codes share an offer ID")
+	}
+}
+
 func TestSplitTarget(t *testing.T) {
 	c, _ := NewCode()
 	for _, tc := range []struct {
@@ -57,7 +137,12 @@ func TestSplitTarget(t *testing.T) {
 		{"fd7a:115c:a1e0::1", "fd7a:115c:a1e0::1", false, false},
 		{"[fd7a:115c:a1e0::1]:" + c.String(), "fd7a:115c:a1e0::1", true, false},
 		{"[fd7a:115c:a1e0::1]", "fd7a:115c:a1e0::1", false, false},
+		{c.String(), "", true, false},
+		{strings.ToUpper(c.String()), "", true, false},
 		{"laptop:8784", "", false, true},
+		{"100.101.102.103:8784", "", false, true},
+		{"[fd7a:115c:a1e0::1]:8784", "", false, true},
+		{"[fd7a:115c:a1e0::1", "", false, true},
 	} {
 		host, code, err := SplitTarget(tc.arg)
 		if (err != nil) != tc.bad || host != tc.host || (code != nil) != tc.code {
@@ -67,82 +152,113 @@ func TestSplitTarget(t *testing.T) {
 			t.Errorf("%q: wrong code", tc.arg)
 		}
 	}
+	if _, _, err := SplitTarget("laptop:8784"); err == nil || !strings.Contains(err.Error(), "--port") {
+		t.Errorf("port hint missing: %v", err)
+	}
 }
 
-func TestHandshakeAndChunks(t *testing.T) {
+func TestHandshake(t *testing.T) {
 	c, _ := NewCode()
-	ss, rs, err := handshake(t, c, c, bind, bind)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ss.ID != rs.ID {
-		t.Fatal("session IDs differ")
-	}
-	root := bytes.Repeat([]byte{7}, 32)
-	chunk := bytes.Repeat([]byte("data"), 1000)
-	sealed, err := ss.SealChunk(root, 3, false, chunk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	again, _ := ss.SealChunk(root, 3, false, chunk)
-	if bytes.Equal(sealed, again) {
-		t.Fatal("nonce reused for re-served chunk")
-	}
-	got, err := rs.OpenChunk(root, 3, len(chunk), false, sealed)
-	if err != nil || !bytes.Equal(got, chunk) {
-		t.Fatal("chunk did not open", err)
-	}
-	for name, open := range map[string]func() error{
-		"index":     func() error { _, e := rs.OpenChunk(root, 4, len(chunk), false, sealed); return e },
-		"last flag": func() error { _, e := rs.OpenChunk(root, 3, len(chunk), true, sealed); return e },
-		"size":      func() error { _, e := rs.OpenChunk(root, 3, len(chunk)-1, false, sealed); return e },
-		"root":      func() error { _, e := rs.OpenChunk(make([]byte, 32), 3, len(chunk), false, sealed); return e },
-		"tamper": func() error {
-			bad := bytes.Clone(sealed)
-			bad[len(bad)-1] ^= 1
-			_, e := rs.OpenChunk(root, 3, len(chunk), false, bad)
-			return e
-		},
-	} {
-		if open() == nil {
-			t.Errorf("%s change accepted", name)
-		}
-	}
-	meta, _ := ss.SealMeta("offer", []byte(`{"name":"secret.pdf"}`))
-	if _, err := rs.OpenMeta("manifest", meta); err == nil {
-		t.Fatal("offer accepted as manifest")
-	}
-	if p, err := rs.OpenMeta("offer", meta); err != nil || string(p) != `{"name":"secret.pdf"}` {
-		t.Fatal("offer did not open")
-	}
-	if !bytes.Equal(ss.AckTag(root), rs.AckTag(root)) {
-		t.Fatal("ack tags differ")
+	b := testBinding(c)
+	got, err := handshake(c, c, b, b, []byte("offer"))
+	if err != nil || string(got) != "offer" {
+		t.Fatalf("%q %v", got, err)
 	}
 }
 
 func TestHandshakeRejects(t *testing.T) {
 	c, _ := NewCode()
 	other, _ := NewCode()
-	if _, _, err := handshake(t, c, other, bind, bind); err == nil {
-		t.Fatal("wrong code accepted")
-	}
-	for _, b := range []Binding{
-		{bind.SenderID, "nOTHERCNTRL", bind.OfferID},
-		{"nOTHERCNTRL", bind.ReceiverID, bind.OfferID},
-		{bind.SenderID, bind.ReceiverID, "ffff"},
+	b := testBinding(c)
+	for name, tc := range map[string]struct {
+		rCode Code
+		rBind Binding
+	}{
+		"wrong code":            {other, b},
+		"code of another offer": {other, testBinding(other)},
+		"wrong receiver ID":     {c, Binding{b.SenderID, "nOTHERCNTRL", b.OfferID}},
+		"wrong sender ID":       {c, Binding{"nOTHERCNTRL", b.ReceiverID, b.OfferID}},
+		"wrong offer ID":        {c, Binding{b.SenderID, b.ReceiverID, other.OfferID()}},
 	} {
-		if _, _, err := handshake(t, c, c, bind, b); err == nil {
-			t.Fatalf("binding mismatch accepted: %+v", b)
+		init, msg1, err := Hello(tc.rCode, tc.rBind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The sender must refuse msg1 and send nothing back.
+		if _, msg2, err := Respond(c, b, msg1, []byte("secret name")); err == nil || msg2 != nil {
+			t.Errorf("%s: sender accepted msg1", name)
+		}
+		_ = init
+	}
+}
+
+func TestConfirmationBinding(t *testing.T) {
+	c, _ := NewCode()
+	b := testBinding(c)
+	init, msg1, _ := Hello(c, b)
+	p, msg2, err := Respond(c, b, msg1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := init.Finish(msg2); err != nil {
+		t.Fatal(err)
+	}
+	confirm, _ := init.Confirmation([]byte("sid-A"))
+	if p.Confirm([]byte("sid-B"), confirm) == nil {
+		t.Fatal("confirmation accepted for another session handle")
+	}
+	// A forged confirmation from someone without the transport key fails.
+	init2, msg1b, _ := Hello(c, b)
+	p2, msg2b, _ := Respond(c, b, msg1b, nil)
+	init2.Finish(msg2b)
+	if p2.Confirm([]byte("sid"), bytes.Repeat([]byte{1}, 40)) == nil {
+		t.Fatal("forged confirmation accepted")
+	}
+}
+
+func TestChunks(t *testing.T) {
+	fk, _ := NewFileKey()
+	k, err := DeriveKeys(fk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, root := []byte("offer-id"), []byte("root")
+	pt := []byte("chunk zero data")
+	sealed, _ := k.SealChunk(id, root, 0, false, pt)
+	again, _ := k.SealChunk(id, root, 0, false, pt)
+	if bytes.Equal(sealed, again) {
+		t.Fatal("nonce reused across seals")
+	}
+	if got, err := k.OpenChunk(nil, id, root, 0, len(pt), false, sealed); err != nil || !bytes.Equal(got, pt) {
+		t.Fatal(err)
+	}
+	other, _ := NewFileKey()
+	k2, _ := DeriveKeys(other)
+	for name, open := range map[string]func() ([]byte, error){
+		"index":     func() ([]byte, error) { return k.OpenChunk(nil, id, root, 1, len(pt), false, sealed) },
+		"last flag": func() ([]byte, error) { return k.OpenChunk(nil, id, root, 0, len(pt), true, sealed) },
+		"size":      func() ([]byte, error) { return k.OpenChunk(nil, id, root, 0, len(pt)-1, false, sealed[:len(sealed)-1]) },
+		"root":      func() ([]byte, error) { return k.OpenChunk(nil, id, []byte("other"), 0, len(pt), false, sealed) },
+		"offer":     func() ([]byte, error) { return k.OpenChunk(nil, []byte("other"), root, 0, len(pt), false, sealed) },
+		"session":   func() ([]byte, error) { return k2.OpenChunk(nil, id, root, 0, len(pt), false, sealed) },
+		"bit flip": func() ([]byte, error) {
+			bad := bytes.Clone(sealed)
+			bad[len(bad)-1] ^= 1
+			return k.OpenChunk(nil, id, root, 0, len(pt), false, bad)
+		},
+	} {
+		if _, err := open(); err == nil {
+			t.Errorf("%s: tampered chunk accepted", name)
 		}
 	}
-	// Separate sessions with the same code have independent keys.
-	s1, _, _ := handshake(t, c, c, bind, bind)
-	_, r2, _ := handshake(t, c, c, bind, bind)
-	sealed, _ := s1.SealChunk(nil, 0, true, []byte("x"))
-	if _, err := r2.OpenChunk(nil, 0, 1, true, sealed); err == nil {
-		t.Fatal("chunk replayed across sessions")
+	m, _ := k.SealManifest(id, root, []byte("hashes"))
+	if _, err := k.OpenManifest(id, root, m); err != nil {
+		t.Fatal(err)
 	}
-	if _, _, err := Respond(c, bind, Hello{make([]byte, 32)}); err == nil {
-		t.Fatal("low-order point accepted")
+	if _, err := k.OpenChunk(nil, id, root, 0, len(m)-Overhead, false, m); err == nil {
+		t.Fatal("manifest accepted as a chunk")
+	}
+	if !k.VerifyAck(id, root, k.AckTag(id, root)) || k2.VerifyAck(id, root, k.AckTag(id, root)) {
+		t.Fatal("ack tag")
 	}
 }

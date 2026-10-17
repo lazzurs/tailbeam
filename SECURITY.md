@@ -28,18 +28,58 @@ does not authenticate native clients; the independent WhoIs check is mandatory.
 No forwarding proxy is trusted, no public name resolution is used for peers,
 and HTTP redirects and environment proxies are disabled. The sender binds only
 its daemon-supplied Tailscale address, never a wildcard or LAN address. The
-Tailscale transport provides encryption and peer authentication; HTTP itself is
-plaintext within that transport. Do not expose the service through another proxy.
+Tailscale transport provides encryption and peer authentication. In the default
+mode the HTTP payloads are additionally end-to-end encrypted (below); with
+`--plaintext`, HTTP is plaintext within the Tailscale transport. Do not expose
+the service through another proxy.
 
-Authorization is at node granularity. It does not distinguish local users or
-processes sharing a node, nor does it pin a human owner independently of that
-node. Tailnet administrators and compromised endpoints remain inside the trust
+Network authorization is at node granularity. It does not distinguish local
+users or processes sharing a node, nor does it pin a human owner independently
+of that node; the transfer code (default mode) adds possession of a secret on
+top. Tailnet administrators and compromised endpoints remain inside the trust
 boundary. Tagged and shared nodes are subject to the same exact-node test.
+
+## End-to-end encrypted mode (default)
+
+The full design, threat model and limits are in
+[docs/e2e-encryption.md](docs/e2e-encryption.md). In brief:
+- **The code:** `send` generates a 128-bit transfer code. The offer is
+  addressed by an HKDF-derived ID that reveals nothing about the code, and
+  there is no plaintext offer endpoint.
+- **Handshake:** the receiver proves the code in a Noise
+  `Noise_NNpsk0_25519_ChaChaPoly_SHA256` handshake (flynn/noise v1.1.0). The
+  handshake prologue binds both stable node IDs, each taken from that side's
+  own daemon, and the offer ID.
+- **Data:** the sender delivers name, size, root and a random per-session file
+  key in handshake message 2. It serves the manifest and chunks only after an
+  encrypted confirmation, sealed with XChaCha20-Poly1305 under HKDF-derived
+  keys. Random nonces are used, and the offer, root, index, length and
+  last-chunk flag are bound as associated data. The ack is an HMAC under a
+  session key.
+- **Burning:** a handshake that does not end in a valid confirmation counts
+  as a failure: bad msg1, bad confirmation, or left unconfirmed for over a
+  minute. Three failures burn the offer.
+
+**What it protects against:** other users or processes on the receiving node
+without the code; anything answering for the sender's or receiver's Tailscale
+IP (routing, netfilter or CGNAT faults); and a node injected by the
+coordination plane.
+
+**What it does not protect against:**
+- Compromised endpoints.
+- A leaked code. On Linux a code on the command line is readable by local
+  users; the receiver warns, and the prompt or `TAILBEAM_CODE` avoid it.
+- Size and timing metadata.
+- Denial of service, including burning.
+- Local users reading the published file in a shared output directory.
+
+The handshake comes from a maintained library and is pinned by its test
+vector. The data-sealing layer is ours. Neither has been externally reviewed.
 
 ## Protocol v2
 
-The default protocol adds a chunk manifest, range reads and on-disk resume
-state. It keeps every v1 gate on every endpoint. Its integrity, resume-file and
+Protocol v2 (used by both modes; plaintext with `--plaintext`) adds a chunk
+manifest, range reads and on-disk resume state. It keeps every v1 gate on every endpoint. Its integrity, resume-file and
 hostile-offer analysis is in [docs/protocol-v2.md](docs/protocol-v2.md).
 Resume files are private, regular-file-only, and discarded unless they match the
 offer's sender, name, size, chunk size and root exactly. The complete partial
@@ -99,7 +139,8 @@ fails; retrying into the same filename is deliberately rejected.
 ## Testing scope
 
 Automated tests use real loopback HTTP with mocked Tailscale identities and cover
-the rejection cases described in the README. They do not prove the correctness
+the rejection cases described in the README, including the encrypted mode's
+wrong-code, binding, tamper, burn and mode-mismatch cases. They do not prove the correctness
 of WireGuard, daemon behavior, tailnet policy, or OS routing. Live cross-host
 validation remains necessary in the intended deployment. No live tailnet
 credentials or configured daemon were available in the build environment.

@@ -189,7 +189,7 @@ func (s *Sender) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Serve waits for the active handler before closing the connection.
 		close(s.done)
 	default:
-		http.NotFound(w, r)
+		notFound(w, r, modePlaintext)
 	}
 }
 
@@ -257,6 +257,9 @@ func request(ctx context.Context, c *http.Client, method, url string) (*http.Res
 	}
 	if resp.StatusCode != http.StatusOK && !(method == "POST" && resp.StatusCode == http.StatusNoContent) {
 		resp.Body.Close()
+		if err := modeError(resp, modeE2E); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("peer returned HTTP %d", resp.StatusCode)
 	}
 	return resp, nil

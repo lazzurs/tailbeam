@@ -3,7 +3,9 @@ module github.com/linuskendall/tailbeam
 go 1.27.1
 
 require (
+	github.com/flynn/noise v1.1.0
 	golang.org/x/crypto v0.57.0
+	golang.org/x/term v0.46.0
 	tailscale.com v1.104.1
 )
 

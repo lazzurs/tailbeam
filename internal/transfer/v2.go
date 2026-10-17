@@ -279,7 +279,7 @@ func (s *SenderV2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		close(s.done)
 	default:
-		http.NotFound(w, r)
+		notFound(w, r, modePlaintext)
 	}
 }
 

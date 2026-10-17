@@ -98,7 +98,7 @@ func (w *tapWriter) Write(p []byte) (int, error) {
 }
 
 func (t *tap) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, "/v2/file/") {
+	if !strings.HasPrefix(r.URL.Path, "/v2/file/") && !strings.HasSuffix(r.URL.Path, "/chunks") {
 		t.h.ServeHTTP(w, r)
 		return
 	}
